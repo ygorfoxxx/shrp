@@ -887,13 +887,13 @@ public Bandido_TalkHttp(playerid, response_code, data[])
     }
 
     // data ja vem em CP1252/text plain, pode ter \n
-    new buf[380];
+    new buf[1024];
     format(buf, sizeof buf, "%s", data);
 
-    // processa ate 3 linhas
-    new line[200];
+    // processa ate 6 linhas (server.js pode quebrar linha grande)
+    new line[220];
     new pos = 0;
-    for(new i=0; i<3; i++)
+    for(new i=0; i<6; i++)
     {
         line[0] = '\0';
 

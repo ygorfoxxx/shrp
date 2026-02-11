@@ -4224,9 +4224,9 @@ enum pInfo
     //academia
     pAcademiaTreinamento,
     // Treinos (limites por rank)
-	pTreinoInter1,
-	pTreinoInter2,
-	pTreinoAvancado,
+    pTreinoInter1,
+    pTreinoInter2,
+    pTreinoAvancado,
 
     pCamping, // Camping
     pFogata,
@@ -4502,6 +4502,7 @@ new Info[MAX_PLAYERS+1][pInfo];
 //#include "Includes\Academia\academia.pwn"
 #include "Includes\Perfil\limiteatributos.pwn"
 #include "Includes\Npcs\bandidos.pwn"
+#include "Includes\Npcs\shinobi_ai.pwn"
 // === Registro de Personagem (fluxo: sexo -> nome -> vila -> elemento -> cl?)
 #include "Includes\Core\registro.pwn"
 
@@ -6001,8 +6002,8 @@ function LoadUser_data(playerid,name[],value[])
     INI_Int("Dengue",Info[playerid][pDengue]);
     //treinos
     INI_Int("TreinoInter1",   Info[playerid][pTreinoInter1]);
-	INI_Int("TreinoInter2",   Info[playerid][pTreinoInter2]);
-	INI_Int("TreinoAvancado", Info[playerid][pTreinoAvancado]);
+    INI_Int("TreinoInter2",   Info[playerid][pTreinoInter2]);
+    INI_Int("TreinoAvancado", Info[playerid][pTreinoAvancado]);
 
     INI_Int("FStyle",Info[playerid][pFStyle]);
     INI_Int("Busqueda",Info[playerid][pWantedLevel]);
@@ -8631,17 +8632,17 @@ public OnPlayerConnect(playerid)
 
     AcademiaTreinos_InitPlayer(playerid);
     RapidDash_InitPlayer(playerid);
-	HBCH_Binds_OnConnect(playerid);
+    HBCH_Binds_OnConnect(playerid);
     Jutsu_BindReset(playerid);
          // >>> INICIALIZA A SKILLBAR COM OS PADRES
     if (funcidx("MSB_OnConnect") != -1)
         CallLocalFunction("MSB_OnConnect", "d", playerid);
 
-	//treinos
+    //treinos
 
-	Info[playerid][pTreinoInter1]   = LA_TREINO_NONE;
-	Info[playerid][pTreinoInter2]   = LA_TREINO_NONE;
-	Info[playerid][pTreinoAvancado] = LA_TREINO_NONE;
+    Info[playerid][pTreinoInter1]   = LA_TREINO_NONE;
+    Info[playerid][pTreinoInter2]   = LA_TREINO_NONE;
+    Info[playerid][pTreinoAvancado] = LA_TREINO_NONE;
 
     // Iniciar
     Streamer_Update(playerid);
@@ -13739,9 +13740,9 @@ function ConvertAccount(playerid)
             INI_WriteInt(File,"Materials",Info[playerid][pMats]);
             INI_WriteInt(File,"Packages",GetPVarInt(playerid, "Packages"));
                 //treinos
-		    INI_WriteInt(File,"TreinoInter1",   Info[playerid][pTreinoInter1]);
-			INI_WriteInt(File,"TreinoInter2",   Info[playerid][pTreinoInter2]);
-			INI_WriteInt(File,"TreinoAvancado", Info[playerid][pTreinoAvancado]);
+            INI_WriteInt(File,"TreinoInter1",   Info[playerid][pTreinoInter1]);
+            INI_WriteInt(File,"TreinoInter2",   Info[playerid][pTreinoInter2]);
+            INI_WriteInt(File,"TreinoAvancado", Info[playerid][pTreinoAvancado]);
             INI_WriteInt(File,"Drugs",Info[playerid][pDrugs]);
             INI_WriteInt(File,"Cosecha",Info[playerid][pCosecha]);
             INI_WriteInt(File,"Crack",Info[playerid][pCrack]);
@@ -14480,16 +14481,22 @@ public IntentarPuenteTimer(playerid)
 {
     IntentarPuente[playerid] = 0;
     SendClientMessageEx(playerid, COLOR_GRAD2, "[CMD] Puedes usar de nuevo el comando /puente.");
+
+    return 1;
 }
 forward IntentarTimer(playerid);
 public IntentarTimer(playerid)
 {
     Intentar[playerid] = 0;
+
+    return 1;
 }
 forward AntiAbusoTimer(playerid);
 public AntiAbusoTimer(playerid)
 {
     AntiAbuso[playerid] = 0;
+
+    return 1;
 }
 function CloseCourtGate1()
 {
@@ -17500,8 +17507,9 @@ function SetPlayerToTeamColor(playerid) // Colores.
 public OnGameModeExit()
 {
 
+    SHRP_NpcAI_Init();
     //Bandido_SystemExit();
-	EcoCore_OnGameModeExit();
+    EcoCore_OnGameModeExit();
     djson_GameModeExit();
     saveAccounts();
     DOF2_Exit();
@@ -19169,8 +19177,9 @@ forward Speedometer(playerid); // Nuevo.
 public OnGameModeInit()
 {
 
+    SHRP_NpcAI_Shutdown();
     Bandido_Init();
-	EcoCore_OnGameModeInit();
+    EcoCore_OnGameModeInit();
     CreateDynamicObject(12014, 1248.7744, -1278.8015, 1677.3565, 0, 0, 0);
 
     SetTimer("LoopsSistemaCraft", 1000, true);
@@ -22907,12 +22916,12 @@ public OnPlayerEditAttachedObject( playerid, response, index, modelid, boneid,Fl
 public OnDialogResponse(playerid, dialogid, response, listitem, inputtext[])
 {
 
-	if(EcoShops_OnDialogResponse(playerid, dialogid, response, listitem, inputtext)) return 1;
+    if(EcoShops_OnDialogResponse(playerid, dialogid, response, listitem, inputtext)) return 1;
     if(BandidoMenu_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
-	if(AcademiaTreinos_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
+    if(AcademiaTreinos_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
     if(Iryou_OnDialogResponse(playerid, dialogid, response, listitem)) return 1;
     if(RegChar_OnDialogResponse(playerid, dialogid, response, listitem, inputtext)) return 1;
-	if(Guerra_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
+    if(Guerra_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
     new sendername[MAX_PLAYER_NAME],giveplayer[MAX_PLAYER_NAME];
     new string[180];
     //new idf = InfoFacc[Info[playerid][pMember]][gMateriales];
@@ -37074,10 +37083,10 @@ case DIALOG_ARMASKUMOG:
                 {
                     InsideMainMenu[playerid] = false;
                     INI_ParseFile(UserPath(playerid), "LoadUser_data", .bExtra = true, .extra = playerid);
-                	//BINDJUTSU salvar
-					new acc[MAX_PLAYER_NAME];
-					GetPlayerName(playerid, acc, sizeof acc); // accountKey = nick (mesma "chave" do .ini)
-					HBCH_Binds_OnLogin(playerid, acc);
+                    //BINDJUTSU salvar
+                    new acc[MAX_PLAYER_NAME];
+                    GetPlayerName(playerid, acc, sizeof acc); // accountKey = nick (mesma "chave" do .ini)
+                    HBCH_Binds_OnLogin(playerid, acc);
                     PlayerLogin(playerid);
                     return 1;
                 }
@@ -45349,7 +45358,7 @@ function ClearJutsu(playerid)
 // Mantm a assinatura antiga para no quebrar nada do servidor
 stock IsPlayerHittable(playerid)
 {
-    return IsPlayerHittableEx(playerid, false); // por padro: NO permite NPC
+     return IsPlayerHittableEx(playerid, SHRP_NpcAI_IsCombatNPC(playerid));
 }
 
 // Nova verso com flag pra permitir NPC quando necessrio
@@ -51372,6 +51381,8 @@ public OnPlayerInteriorChange(playerid,newinteriorid,oldinteriorid){
         Info[playerid][pInt] = newinteriorid;
     }
     Streamer_Update(playerid);
+
+    return 1;
 }
 
 hackerTrigger(playerid,newweapon){
@@ -56518,6 +56529,8 @@ public SendMessage()
             SetTimer("StopMessage", 6000, 0);
         }
     }
+
+    return 1;
 }
 
 
@@ -56525,11 +56538,15 @@ forward StopMessage();
 public StopMessage()
 {
   TextDrawHideForAll(Text:Messageafk);
+
+    return 1;
 }
 //*****************
 public KickxD(playerid)
 {
     Kick(playerid);
+
+    return 1;
 }
 public AutoJailMG(playerid)
 {
@@ -64030,7 +64047,7 @@ Atacar(playerid, newkeys, oldkeys)
     if(CarregandoChakra[playerid] == 1){PCarregandoChakra(playerid); return 1;}
     if(Pescando[playerid] == 1 || ChuteForteAtivou[playerid] == 1 || PlayerRaijinVoador[playerid][raijinUsado] || PlayerRaijinVoador[playerid][raijinAtingido]) return 0;
     if(ComboLockGround[playerid] == 1 && IsPlayerInAir[playerid] == 0) return 0;
-	if(Meditando[playerid] == 1) return 0;
+    if(Meditando[playerid] == 1) return 0;
     if(UsandoKit[playerid] == 1) return 0;
     if(DashFHitted[playerid] || Info[playerid][pNinjaQuebrado] == 1 || Info[playerid][pNinjaQuebrado] == 2 || Info[playerid][pNinjaQuebrado] == 3) return 0;
     if(Amarrado[playerid] == 1 || RasenganAt[playerid] == 1) return 0;
@@ -70956,7 +70973,7 @@ if(GetPVarInt(playerid, "NNRP_GSTUN") == 1)
 }
 
     // n?o deixa usar kawarimi durante RapidDash (ou quando estiver marcado pelo lock)
-	if(GetPVarInt(playerid, "NNRP_NO_KAWARIMI") == 1)
+    if(GetPVarInt(playerid, "NNRP_NO_KAWARIMI") == 1)
     return SendClientMessage(playerid, -1, "{EF0D02}(AVISO){FFFFFF} Voc? n?o pode usar Kawarimi durante uma investida.");
     if(Meditando[playerid] == 1) return 0;
     if(lastHitted[playerid][hitReason] > 1 || lastJutsu[playerid][jutsuLast] >= 1) return 0;
@@ -71043,8 +71060,8 @@ else
 
     foreach(Player, i)
     {
-    	if(IsPlayerNPC(i)) continue;  // <<< FIX CRÍTICO
-   		ShowPlayerNameTagForPlayer(i, playerid, 0);
+        if(IsPlayerNPC(i)) continue;  // <<< FIX CRÍTICO
+           ShowPlayerNameTagForPlayer(i, playerid, 0);
     }
 
     return 1;
@@ -73871,9 +73888,9 @@ function TeclaFalarLojas(playerid, newkeys, oldkeys)
         {
             Audio_Play(playerid, 58);
 
-		new p1 = Eco_PreviewPrice(playerid, ECO_OWNER_COMIDA, 30);
-		new p2 = Eco_PreviewPrice(playerid, ECO_OWNER_COMIDA, 40);
-		new p3 = Eco_PreviewPrice(playerid, ECO_OWNER_COMIDA, 40);
+        new p1 = Eco_PreviewPrice(playerid, ECO_OWNER_COMIDA, 30);
+        new p2 = Eco_PreviewPrice(playerid, ECO_OWNER_COMIDA, 40);
+        new p3 = Eco_PreviewPrice(playerid, ECO_OWNER_COMIDA, 40);
 
 
             new body[512];
@@ -76132,6 +76149,8 @@ public AtivarRasenganAposAnim(playerid)
     DashUsado[playerid] = 0;
     DashCount[playerid] = 0;
     Invunerable[playerid] = 0;
+
+    return 1;
 }
 
 function RasenganOff(playerid)
@@ -78642,6 +78661,8 @@ public TimerDesativarSapo(playerid)
     SetTimerEx("DestroyObject", 5000, false, "d", obj);
 
     //CreateObject(18683, x, y, z-5.5, 0, 0, 0);
+
+    return 1;
 }
 
 function SapoInvocacaoSay(playerid)
