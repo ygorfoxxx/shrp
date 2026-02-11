@@ -660,4 +660,5 @@ stock bool:SHRP_NpcHirePatrolFromTreasury(playerid, const name[], skin, cost, Fl
     SHRP_NpcSetPatrolRadius(slot, radius);
     return true;
 }
+
 #endif

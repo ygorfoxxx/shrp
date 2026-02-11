@@ -4502,9 +4502,10 @@ new Info[MAX_PLAYERS+1][pInfo];
 //#include "Includes\Academia\academia.pwn"
 #include "Includes\Perfil\limiteatributos.pwn"
 #include "Includes\Npcs\bandidos.pwn"
-#include "Includes\Npcs\shinobi_ai.pwn"
+#include "Includes\Npcs\shinobi_system_v1.pwn"
 // === Registro de Personagem (fluxo: sexo -> nome -> vila -> elemento -> cl?)
 #include "Includes\Core\registro.pwn"
+
 
 
 // === Config do Registro: vilas extras (slots bloqueados 5-7)
@@ -14090,6 +14091,8 @@ function ConvertAccount(playerid)
 public OnPlayerDisconnect(playerid, reason)
 {
 
+    ShinobiSys_OnPlayerDeath(playerid, killerid, reason);
+
     if(IsPlayerNPC(playerid))
     {
         // FCNPC: se este NPC for um bandido, limpa o slot/timers (evita crash ao afastar/destruir).
@@ -17507,7 +17510,8 @@ function SetPlayerToTeamColor(playerid) // Colores.
 public OnGameModeExit()
 {
 
-    SHRP_NpcAI_Init();
+    ShinobiSys_OnGameModeExit();
+
     //Bandido_SystemExit();
     EcoCore_OnGameModeExit();
     djson_GameModeExit();
@@ -19177,7 +19181,7 @@ forward Speedometer(playerid); // Nuevo.
 public OnGameModeInit()
 {
 
-    SHRP_NpcAI_Shutdown();
+    ShinobiSys_OnGameModeInit();
     Bandido_Init();
     EcoCore_OnGameModeInit();
     CreateDynamicObject(12014, 1248.7744, -1278.8015, 1677.3565, 0, 0, 0);
@@ -22916,6 +22920,7 @@ public OnPlayerEditAttachedObject( playerid, response, index, modelid, boneid,Fl
 public OnDialogResponse(playerid, dialogid, response, listitem, inputtext[])
 {
 
+    if(ShinobiSys_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
     if(EcoShops_OnDialogResponse(playerid, dialogid, response, listitem, inputtext)) return 1;
     if(BandidoMenu_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
     if(AcademiaTreinos_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
