@@ -74,7 +74,7 @@
 // Retorno: text/plain (CP1252) com linhas "ACT:" / "SAY:" 
 // ----------------------------------------------------------
 #if !defined NPCGPT_URL
-    #define NPCGPT_URL "http://127.0.0.1:3333/npc"
+    #define NPCGPT_URL "127.0.0.1:3333/npc"
 #endif
 
 #if !defined NPCGPT_SECRET
@@ -217,6 +217,38 @@ stock Bandido_URLEncodeCP1252(const in[], out[], outLen)
 }
 
 
+// ----------------------------------------------------------
+// SA-MP HTTP() em muitos packs NAO aceita "http://" / "https://".
+// Por compatibilidade, removemos automaticamente se vier.
+// ----------------------------------------------------------
+stock Bandido_BuildHttpUrl(out[], outLen)
+{
+    format(out, outLen, "%s", NPCGPT_URL);
+
+    // remove "http://"
+    if( (out[0] == 'h' || out[0] == 'H') &&
+        (out[1] == 't' || out[1] == 'T') &&
+        (out[2] == 't' || out[2] == 'T') &&
+        (out[3] == 'p' || out[3] == 'P') &&
+        (out[4] == ':') && (out[5] == '/') && (out[6] == '/') )
+    {
+        strdel(out, 0, 7);
+    }
+    // remove "https://"
+    else if( (out[0] == 'h' || out[0] == 'H') &&
+        (out[1] == 't' || out[1] == 'T') &&
+        (out[2] == 't' || out[2] == 'T') &&
+        (out[3] == 'p' || out[3] == 'P') &&
+        (out[4] == 's' || out[4] == 'S') &&
+        (out[5] == ':') && (out[6] == '/') && (out[7] == '/') )
+    {
+        strdel(out, 0, 8);
+    }
+    return 1;
+}
+
+
+
 stock bool:Bandido_PrefixI(const s[], const prefix[])
 {
     for(new i=0; prefix[i] != '\0'; i++)
@@ -255,8 +287,13 @@ stock Bandido_PlayerSayNear(playerid, const msg[], Float:radius = BANDIDO_SAY_RA
 
     new vw = GetPlayerVirtualWorld(playerid);
 
-    new pname[MAX_PLAYER_NAME];
-    GetPlayerName(playerid, pname, sizeof pname);
+    new pname[32];
+    pname[0] = '\0';
+    // Preferir nome de personagem do RP (Info[][pNome])
+    if(Info[playerid][pNome][0] != '\0')
+        format(pname, sizeof pname, "%s", Info[playerid][pNome]);
+    else
+        GetPlayerName(playerid, pname, sizeof pname);
 
     new out[220];
     format(out, sizeof out, "%s diz: %s", pname, msg);
@@ -392,15 +429,6 @@ stock Bandido_UpdateLabel(slot)
 
     new vila[24];
     Bandido_VilaNome(BandidoMember[slot], vila, sizeof vila);
-
-    new text[180];
-    format(text, sizeof text,
-        "{E9FE23}[NPC]{FFFFFF} %s\n{AB7C4E}Vila:{FFFFFF} %s\n{FFFFFF}Fale no chat bem perto",
-        BandidoName[slot], vila
-    );
-
-    BandidoLabel[slot] = Create3DTextLabel(text, 0xFFFFFFFF, 0.0, 0.0, 0.0, 18.0, 0, 0);
-    Attach3DTextLabelToPlayer(BandidoLabel[slot], gBandidoNpc[slot], 0.0, 0.0, 0.65);
     return 1;
 }
 
@@ -810,22 +838,32 @@ stock Bandido_HandleTalk(slot, playerid, const msg[])
     new personaRaw[600];
     Bandido_BuildPersona(slot, personaRaw, sizeof personaRaw);
 
-    new encNpc[96], encPersona[1200], encMsg[1200];
+    new charRaw[32];
+    charRaw[0] = '\0';
+    if(Info[playerid][pNome][0] != '\0')
+        format(charRaw, sizeof charRaw, "%s", Info[playerid][pNome]);
+    else
+        GetPlayerName(playerid, charRaw, sizeof charRaw);
+
+    new encNpc[96], encChar[96], encPersona[1200], encMsg[1200];
     Bandido_URLEncodeCP1252(BandidoName[slot], encNpc, sizeof encNpc);
+    Bandido_URLEncodeCP1252(charRaw, encChar, sizeof encChar);
     Bandido_URLEncodeCP1252(personaRaw, encPersona, sizeof encPersona);
     Bandido_URLEncodeCP1252(msg, encMsg, sizeof encMsg);
 
     new data[2048];
     format(data, sizeof data,
-        "secret=%s&mode=chat&npcname=%s&persona=%s&msg=%s&playerid=%d&slot=%d",
-        NPCGPT_SECRET, encNpc, encPersona, encMsg, playerid, slot
+        "secret=%s&mode=chat&npcname=%s&charname=%s&persona=%s&msg=%s&playerid=%d&slot=%d",
+        NPCGPT_SECRET, encNpc, encChar, encPersona, encMsg, playerid, slot
     );
 
     // Dispara HTTP
     gBandidoTalkPending[playerid] = true;
     gBandidoTalkPendingSlot[playerid] = slot;
 
-    gBandidoTalkHttpId[playerid] = HTTP(playerid, HTTP_POST, NPCGPT_URL, data, "Bandido_TalkHttp");
+    new url[128];
+    Bandido_BuildHttpUrl(url, sizeof url);
+    gBandidoTalkHttpId[playerid] = HTTP(playerid, HTTP_POST, url, data, "Bandido_TalkHttp");
     return 1;
 }
 
@@ -872,21 +910,26 @@ public Bandido_TalkHttp(playerid, response_code, data[])
 
         // trim simples
         while(line[0] == ' ') strdel(line, 0, 1);
+        // trim final (remove \r e espacos no fim)
+        new ll = strlen(line);
+        while(ll > 0 && (line[ll-1] == '\r' || line[ll-1] == ' ')) { line[ll-1] = '\0'; ll--; }
 
         if(Bandido_PrefixI(line, "ACT:"))
         {
             // remove prefixo "ACT:"
             new act[180];
-            format(act, sizeof act, "%s", line[4]);
+            if(strlen(line) > 4) strmid(act, line, 4, strlen(line), sizeof act);
+            else act[0] = '\0';
             while(act[0] == ' ') strdel(act, 0, 1);
-            Bandido_NpcActNear(slot, act, 18.0);
+            if(act[0]) Bandido_NpcActNear(slot, act, 18.0);
         }
         else if(Bandido_PrefixI(line, "SAY:"))
         {
             new say[180];
-            format(say, sizeof say, "%s", line[4]);
+            if(strlen(line) > 4) strmid(say, line, 4, strlen(line), sizeof say);
+            else say[0] = '\0';
             while(say[0] == ' ') strdel(say, 0, 1);
-            Bandido_SayNear(slot, say, 18.0);
+            if(say[0]) Bandido_SayNear(slot, say, 18.0);
         }
         else
         {

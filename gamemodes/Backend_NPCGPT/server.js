@@ -24,6 +24,7 @@
 
 import "dotenv/config";
 import express from "express";
+import fs from "node:fs";
 
 const app = express();
 app.use(express.raw({ type: "*/*", limit: "128kb" }));
@@ -31,6 +32,7 @@ app.use(express.raw({ type: "*/*", limit: "128kb" }));
 const PORT = Number(process.env.PORT || 3333);
 const SECRET = String(process.env.NPCGPT_SECRET || "").trim();
 const DEBUG = String(process.env.NPCGPT_DEBUG || "0") === "1";
+const MAX_CHARS = Number(process.env.NPCGPT_MAX_CHARS || 220);
 
 const PROVIDER = String(process.env.NPCGPT_PROVIDER || "groq").trim().toLowerCase();
 
@@ -49,6 +51,116 @@ const GROQ_KEYS = (
 
 if (!SECRET) console.log("[NPCGPT] AVISO: NPCGPT_SECRET não definida no .env");
 if (PROVIDER === "groq" && GROQ_KEYS.length === 0) console.log("[NPCGPT] AVISO: GROQ_API_KEY/GROQ_API_KEYS não definida no .env");
+
+// ---------------- LORE DO SERVIDOR (arquivo grande) ----------------
+// Use com RAG simples pra nao estourar contexto.
+// .env:
+//   NPCGPT_LORE_MODE=rag|brief|full|off   (default rag)
+//   NPCGPT_LORE_PATH=./lore.txt
+//   NPCGPT_LORE_BRIEF_PATH=./lore_brief.txt
+//   NPCGPT_LORE_SNIPPET_CHARS=1200
+//   NPCGPT_LORE_WATCH=1
+const LORE_MODE = String(process.env.NPCGPT_LORE_MODE || "rag").trim().toLowerCase();
+const LORE_PATH = String(process.env.NPCGPT_LORE_PATH || "./lore.txt").trim();
+const LORE_BRIEF_PATH = String(process.env.NPCGPT_LORE_BRIEF_PATH || "./lore_brief.txt").trim();
+const LORE_SNIPPET_CHARS = Number(process.env.NPCGPT_LORE_SNIPPET_CHARS || 1200);
+const LORE_WATCH = String(process.env.NPCGPT_LORE_WATCH || "1").trim() === "1";
+
+let loreRaw = "";
+let loreChunks = [];
+let loreBrief = "";
+let loreMtimeMs = 0;
+
+function safeReadFile(path) {
+  try { return fs.readFileSync(path, "utf8"); } catch { return ""; }
+}
+function chunkLore(raw) {
+  const parts = String(raw || "").split(/\n{2,}/).map(s => s.trim()).filter(Boolean);
+  const chunks = [];
+  let cur = "";
+  for (const p of parts) {
+    if (!cur) { cur = p; continue; }
+    if ((cur.length + 2 + p.length) <= 900) cur = cur + "\n\n" + p;
+    else { chunks.push(cur); cur = p; }
+  }
+  if (cur) chunks.push(cur);
+  return chunks;
+}
+function reloadLoreIfNeeded() {
+  if (LORE_MODE === "off") return;
+  try {
+    const st = fs.statSync(LORE_PATH);
+    if (st.mtimeMs !== loreMtimeMs) {
+      loreMtimeMs = st.mtimeMs;
+      loreRaw = safeReadFile(LORE_PATH);
+      loreChunks = chunkLore(loreRaw);
+      loreBrief = safeReadFile(LORE_BRIEF_PATH).trim();
+      if (!loreBrief) loreBrief = loreRaw.trim().slice(0, 650);
+      if (DEBUG) console.log(`[NPCGPT] Lore recarregado: ${LORE_PATH} (chunks=${loreChunks.length})`);
+    }
+  } catch {
+    loreRaw = "";
+    loreChunks = [];
+    loreBrief = "";
+  }
+}
+function normTokens(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s-]+/gu, " ")
+    .split(/\s+/)
+    .filter(t => t.length >= 3)
+    .slice(0, 40);
+}
+function loreRag(query) {
+  if (!loreChunks.length) return "";
+  const toks = normTokens(query);
+  if (!toks.length) return "";
+
+  const scored = loreChunks.map((c) => {
+    const lower = c.toLowerCase();
+    let score = 0;
+    for (const t of toks) if (lower.includes(t)) score += 1;
+    return { c, score };
+  }).filter(x => x.score > 0);
+
+  scored.sort((a, b) => b.score - a.score);
+
+  const picked = [];
+  let used = 0;
+  for (const it of scored.slice(0, 6)) {
+    const add = it.c.trim();
+    if (!add) continue;
+    if (used + add.length + 2 > LORE_SNIPPET_CHARS) break;
+    picked.push(add);
+    used += add.length + 2;
+    if (picked.length >= 3) break;
+  }
+  return picked.join("\n\n").trim();
+}
+function getLoreContext({ msg, npcname, persona }) {
+  if (LORE_MODE === "off") return "";
+  reloadLoreIfNeeded();
+  if (!loreRaw) return "";
+
+  if (LORE_MODE === "full") return loreRaw.trim().slice(0, LORE_SNIPPET_CHARS);
+  if (LORE_MODE === "brief") return String(loreBrief || "").trim().slice(0, LORE_SNIPPET_CHARS);
+
+  // rag
+  const q = `${npcname || ""} ${persona || ""} ${msg || ""}`.trim();
+  const rag = loreRag(q);
+  const brief = String(loreBrief || "").trim().slice(0, 500);
+  if (rag) return (brief ? (brief + "\n\n" + rag) : rag).slice(0, LORE_SNIPPET_CHARS);
+  return brief.slice(0, LORE_SNIPPET_CHARS);
+}
+
+if (LORE_WATCH && LORE_MODE !== "off") {
+  try { fs.watch(LORE_PATH, { persistent: false }, () => reloadLoreIfNeeded()); } catch {}
+  try { fs.watch(LORE_BRIEF_PATH, { persistent: false }, () => reloadLoreIfNeeded()); } catch {}
+}
+reloadLoreIfNeeded();
+// ------------------------------------------------------------
+
 
 // ---------------- CP1252 helpers ----------------
 
@@ -145,9 +257,9 @@ function cleanTextForSAMP(text) {
   t = t.replace(/[ \t]{2,}/g, " ").trim();
 
   // limita tamanho total
-  if (t.length > 350) t = t.slice(0, 350).trim();
+  if (t.length > MAX_CHARS) t = t.slice(0, MAX_CHARS).trim();
 
-  return t;
+  return antiPlayerWords(t);
 }
 
 function safeStr(v, max = 900) {
@@ -173,16 +285,18 @@ function rlAllow() {
 }
 
 // ---------------- Memória curta por jogador (pra não ficar "tosco") ----------------
-const MEM_MAX_TURNS = Math.max(2, Math.min(10, Number(process.env.NPCGPT_MEM_TURNS || 6)));
+const MEM_MAX_TURNS = Math.max(0, Math.min(10, Number(process.env.NPCGPT_MEM_TURNS || 6))); // 0 desliga
 const memory = new Map(); // key = `${slot}:${playerid}` -> [{role, content}...]
 
 function memKey(slot, playerid) {
   return `${slot}:${playerid}`;
 }
 function memGet(slot, playerid) {
+  if (!MEM_MAX_TURNS) return [];
   return memory.get(memKey(slot, playerid)) || [];
 }
 function memPush(slot, playerid, role, content) {
+  if (!MEM_MAX_TURNS) return;
   const k = memKey(slot, playerid);
   const arr = memory.get(k) || [];
   arr.push({ role, content });
@@ -232,20 +346,25 @@ async function groqChat({ messages, temperature, maxTokens }) {
   return String(out);
 }
 
-function buildSystemPrompt({ npcname, persona, age, elem, behav, passive }) {
+function buildSystemPrompt({ npcname, persona, age, elem, behav, passive, charname, maxChars, loreContext }) {
   const personaLine = persona ? `História/Persona do NPC (use isso como verdade): ${persona}` : "";
+  const loreLine = loreContext ? `Lore do servidor (use como CANON):\n${loreContext}` : "";
 
   // Regras que você pediu:
   // - Até 3 linhas
-  // - 280~350 caracteres (alvo)
+  // - Pode ser curto (nao forcar encher linguiça)
   // - Pode usar ação no estilo /eu
   // - Fala séria, shinobi do universo do Kishimoto
   return [
     `Você é ${npcname}, um shinobi do universo de Naruto (Masashi Kishimoto). Você é um personagem real desse mundo.`,
     personaLine,
+    loreLine,
     `Dados rápidos: idade=${age || "?"} elemento=${elem || "?"} comportamento=${behav || "?"} passivo=${passive || "?"}.`,
     "Responda sempre em PT-BR, sem emojis, sem aspas no começo/fim, e sem meta (não diga que é IA).",
-    "A resposta deve ter no máximo 3 linhas e entre 280 e 350 caracteres (alvo).",
+    charname ? `O interlocutor e um PERSONAGEM chamado ${charname}. Trate como personagem (use "voce" ou o nome dele).` : "O interlocutor e um PERSONAGEM. Trate como personagem (use \"voce\").",
+    "NUNCA use as palavras jogador, player, usuario. Nunca fale de Groq/IA/tecnologia real; responda como shinobi do mundo.",
+    "Evite repetir bordoes e frases inteiras usadas recentemente. Se ja disse algo parecido, reformule.",
+    `A resposta deve ter no maximo 3 linhas e no maximo ${maxChars} caracteres no total. Pode ser curta.`,
     "Formato OBRIGATÓRIO por linha:",
     "Se você usar ACT:, você DEVE enviar também uma linha SAY: logo abaixo (ACT na 1ª linha, SAY na 2ª).",
     "Se o player escrever uma ação usando /eu, responda com ACT: (reação/ação do NPC) e em seguida SAY: (fala do NPC).",
@@ -256,6 +375,26 @@ function buildSystemPrompt({ npcname, persona, age, elem, behav, passive }) {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function antiPlayerWords(protocolText) {
+  const lines = String(protocolText || "").split("\n");
+  const out = lines.map((ln) => {
+    const st = ln.trim();
+    if (/^ACT:/i.test(st)) {
+      return st
+        .replace(/\b(o|a)\s+jogador(a)?\b/gi, "a figura a frente")
+        .replace(/\bjogador(a)?\b/gi, "a figura")
+        .replace(/\bplayer\b/gi, "a figura a frente")
+        .replace(/\busu[aá]rio\b/gi, "a figura");
+    }
+    return st
+      .replace(/\b(o|a)\s+jogador(a)?\b/gi, "voce")
+      .replace(/\bjogador(a)?\b/gi, "voce")
+      .replace(/\bplayer\b/gi, "voce")
+      .replace(/\busu[aá]rio\b/gi, "voce");
+  });
+  return out.join("\n");
 }
 
 function parseModelOutputToProtocol(text) {
@@ -272,25 +411,19 @@ function parseModelOutputToProtocol(text) {
   // Se veio ACT sem SAY, o SA-MP acaba mostrando só a ação.
   // Força uma fala curta (2ª linha) para sempre ter ação + fala.
   if (/^ACT:/i.test(t) && !/\n\s*SAY:/i.test(t)) {
-    t = `${t}\nSAY: Minha história não é conto pra criança. Chega mais, fala baixo… e eu decido o que merece ouvir.`;
+    const fall = [
+      "SAY: Fala baixo. O que voce quer?",
+      "SAY: Sem rodeio. Diz logo.",
+      "SAY: Aqui nao e lugar pra conversa alta.",
+      "SAY: Se tem segredo, fala perto.",
+    ];
+    t = `${t}\n${fall[Math.floor(Math.random() * fall.length)]}`;
     t = cleanTextForSAMP(t);
-    // garante no máximo 3 linhas
     t = t.split("\n").slice(0, 3).join("\n").trim();
   }
 
-  // Se ficou muito curto, tenta "engordar" sem quebrar regra (não é perfeito, mas ajuda)
-  if (t.length < 220) {
-    // adiciona uma frase curta ainda como SAY:
-    if (/^ACT:/i.test(t)) {
-      t = t + "\nSAY: Fica atento. Aqui, vacilo vira funerária.";
-    } else if (/^SAY:/i.test(t)) {
-      t = t.replace(/\s*$/, " Fica atento. Aqui, vacilo vira funerária.");
-    }
-    t = cleanTextForSAMP(t);
-  }
-
-  // Nunca mais de 350 chars
-  if (t.length > 350) t = t.slice(0, 350).trim();
+  // Nunca mais que o limite do .env (NPCGPT_MAX_CHARS)
+  if (t.length > MAX_CHARS) t = t.slice(0, MAX_CHARS).trim();
 
   return t;
 }
@@ -314,6 +447,7 @@ app.post("/npc", async (req, res) => {
 
   const mode = safeStr(p.mode || "chat", 16).toLowerCase(); // "chat" ou "admin" (admin não usado aqui)
   const npcname = safeStr(p.npcname || "NPC", 32);
+  const charname = safeStr(p.charname || p.playername || "", 32);
   const persona = safeStr(p.persona || "", 520);
   const msg = safeStr(p.msg || "", 900);
 
@@ -325,9 +459,10 @@ app.post("/npc", async (req, res) => {
   const behav = safeStr(p.behav || "", 8);
   const passive = safeStr(p.passive || "", 8);
 
-  if (DEBUG) console.log(`[NPCGPT] REQ slot=${slot} player=${playerid} npc=${npcname}: ${msg}`);
+  if (DEBUG) console.log(`[NPCGPT] REQ slot=${slot} player=${playerid}${charname ? " char="+charname : ""} npc=${npcname}: ${msg}`);
 
-  const system = buildSystemPrompt({ npcname, persona, age, elem, behav, passive });
+  const loreContext = getLoreContext({ msg, npcname, persona });
+  const system = buildSystemPrompt({ npcname, persona, age, elem, behav, passive, charname, maxChars: MAX_CHARS, loreContext });
 
   // memória curta (por player + NPC slot)
   const mem = memGet(slot, playerid);
@@ -346,7 +481,7 @@ app.post("/npc", async (req, res) => {
       rawOut = await groqChat({
         messages,
         temperature: 0.85,
-        maxTokens: 220, // suficiente pra 3 linhas 280~350 chars
+        maxTokens: 160, // suficiente pra ate 3 linhas curtas
       });
     } else {
       rawOut = "SAY: Provedor inválido no servidor.";
