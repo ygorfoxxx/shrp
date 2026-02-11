@@ -50,6 +50,14 @@
 
 #include <FCNPC>
 
+// Tipos do shinobi_ai (fallback, caso nao tenha incluido ainda)
+#if !defined NPCT_HOSTILE
+    #define NPCT_HOSTILE (1)
+    #define NPCT_GUARD   (2)
+    #define NPCT_PATROL  (3)
+#endif
+
+
 
 #if !defined HTTP_POST
     #define HTTP_POST (2)
@@ -102,13 +110,16 @@ forward Bandido_TalkHttp(playerid, response_code, data[]);
 #define DLG_BANDIDO_PERSONA         (BANDIDO_DLG_BASE+6)
 #define DLG_BANDIDO_HISTORIA        (BANDIDO_DLG_BASE+7)
 #define DLG_BANDIDO_CONFIRM         (BANDIDO_DLG_BASE+8)
+#define DLG_BANDIDO_HP              (BANDIDO_DLG_BASE+9)
 
 // ----------------------------------------------------------
 // STORAGE (somente o necessario)
 // ----------------------------------------------------------
 new gBandidoNpc[MAXIMO_BANDIDOS]; // playerid do FCNPC
+new gBandidoAISlot[MAXIMO_BANDIDOS]; // slot do shinobi_ai (se usado)
 new BandidoMember[MAXIMO_BANDIDOS];                        // vila (Info[][pMember])
 new BandidoSkin[MAXIMO_BANDIDOS];
+new Float:BandidoHPMax[MAXIMO_BANDIDOS];
 new BandidoVW[MAXIMO_BANDIDOS];
 new BandidoInterior[MAXIMO_BANDIDOS];
 new Float:BandidoSpawn[MAXIMO_BANDIDOS][3];
@@ -127,6 +138,7 @@ new bool:gBMenuActive[MAX_PLAYERS];
 new gBMenuSlot[MAX_PLAYERS];
 new gBMenuMember[MAX_PLAYERS];
 new gBMenuSkin[MAX_PLAYERS];
+new Float:gBMenuHP[MAX_PLAYERS];
 new gBMenuName[MAX_PLAYERS][32];
 new gBMenuPersona[MAX_PLAYERS][128];
 new gBMenuHistoria[MAX_PLAYERS][128];
@@ -465,8 +477,10 @@ stock Bandido_Init()
 stock Bandido_ResetSlot(slot)
 {
     gBandidoNpc[slot] = INVALID_PLAYER_ID;
+    gBandidoAISlot[slot] = -1;
     BandidoMember[slot] = 0;
     BandidoSkin[slot] = 0;
+    BandidoHPMax[slot] = 120.0;
     BandidoVW[slot] = 0;
     BandidoInterior[slot] = 0;
     BandidoSpawn[slot][0] = 0.0;
@@ -497,14 +511,20 @@ stock Bandido_Destroy(slot)
 
     if(Bandido_IsNpcValid(slot))
     {
-        FCNPC_Destroy(gBandidoNpc[slot]);
+        // Se foi criado pelo shinobi_ai, destrui pelo slot (evita ficar invulneravel)
+        #if defined SHRP_NpcDestroy
+            if(gBandidoAISlot[slot] != -1) { SHRP_NpcDestroy(gBandidoAISlot[slot]); }
+            else { FCNPC_Destroy(gBandidoNpc[slot]); }
+        #else
+            FCNPC_Destroy(gBandidoNpc[slot]);
+        #endif
     }
 
     Bandido_ResetSlot(slot);
     return 1;
 }
 
-stock Bandido_Create(slot, skinid, const name[], member, const persona[], const historia[])
+stock Bandido_Create(slot, skinid, Float:hpmax, const name[], member, const persona[], const historia[])
 {
     if(!Bandido_IsValidSlot(slot)) return 0;
 
@@ -512,21 +532,47 @@ stock Bandido_Create(slot, skinid, const name[], member, const persona[], const 
 
     BandidoMember[slot] = member;
     BandidoSkin[slot] = skinid;
+    BandidoHPMax[slot] = hpmax;
     format(BandidoName[slot], sizeof BandidoName[], "%s", name);
     format(BandidoPersona[slot], sizeof BandidoPersona[], "%s", persona);
     format(BandidoHistoria[slot], sizeof BandidoHistoria[], "%s", historia);
 
     if(BandidoTalkDist[slot] < 1.5) BandidoTalkDist[slot] = BANDIDO_TALK_DIST_DEFAULT;
 
+    // Criacao do NPC:
+    // - Cria via FCNPC (sempre), para evitar dependncia de ordem de includes.
+    // - Se o shinobi_ai estiver carregado, registra o NPC no AI via CallLocalFunction (runtime).
     new npcid = FCNPC_Create(BandidoName[slot]);
     if(npcid == INVALID_PLAYER_ID) return 0;
-
     gBandidoNpc[slot] = npcid;
+    gBandidoAISlot[slot] = -1;
 
     FCNPC_Spawn(npcid, BandidoSkin[slot], BandidoSpawn[slot][0], BandidoSpawn[slot][1], BandidoSpawn[slot][2]);
-
     SetPlayerVirtualWorld(npcid, BandidoVW[slot]);
     SetPlayerInterior(npcid, BandidoInterior[slot]);
+
+    // Vida base do NPC (tambem vale pra skin custom)
+    SetPlayerHealth(npcid, BandidoHPMax[slot]);
+
+    // Registrar no AI (se existir) para liberar taijutsu/stun/alvo e combate real
+    new f = funcidx("SHRP_NpcAI_RegisterExisting");
+    if(f != -1)
+    {
+        // (npcid, type, vila, x, y, z, vw, interior) -> slot
+        new aislot = CallLocalFunction("SHRP_NpcAI_RegisterExisting", "iiifffii",
+            npcid, 1/*NPCT_HOSTILE*/, BandidoMember[slot],
+            BandidoSpawn[slot][0], BandidoSpawn[slot][1], BandidoSpawn[slot][2], BandidoVW[slot], BandidoInterior[slot]);
+        if(aislot != -1)
+        {
+            #if defined SHRP_NpcSetHP
+                SHRP_NpcSetHP(aislot, BandidoHPMax[slot]);
+            #endif
+            gBandidoAISlot[slot] = aislot;
+            // balance default (pode ajustar via menu depois)
+            // balance default (pode ajustar via menu depois)
+            if(funcidx("SHRP_NpcAI_ConfigureDefaults") != -1) CallLocalFunction("SHRP_NpcAI_ConfigureDefaults", "i", aislot);
+    }
+    }
 
     Bandido_ApplyBandana(slot);
     Bandido_UpdateLabel(slot);
@@ -553,6 +599,7 @@ stock BandidoMenu_Reset(playerid)
     gBMenuSlot[playerid] = -1;
     gBMenuMember[playerid] = 0;
     gBMenuSkin[playerid] = GetPlayerSkin(playerid);
+    gBMenuHP[playerid] = 120.0;
 
     gBMenuName[playerid][0] = '\0';
     gBMenuPersona[playerid][0] = '\0';
@@ -679,11 +726,37 @@ stock BandidoMenu_OnDialog(playerid, dialogid, response, listitem, inputtext[])
                     "SkinID", "Digite um numero (SkinID).", "OK", "Voltar"), 1;
 
             new skin = strval(inputtext);
-            if(skin < 0 || skin > 311)
+            if(!((skin >= 0 && skin <= 311) || (skin >= 20001 && skin <= 20226)))
                 return ShowPlayerDialog(playerid, DLG_BANDIDO_SKIN, DIALOG_STYLE_INPUT,
-                    "SkinID", "SkinID invalido.\nDigite novamente:", "OK", "Voltar"), 1;
+                    "SkinID", "SkinID invalido.\nUse 0-311 ou 20001-20226 (custom 0.3.DL).", "OK", "Voltar"), 1;
 
             gBMenuSkin[playerid] = skin;
+
+            new msg2[160];
+            format(msg2, sizeof msg2, "Digite a VIDA do NPC (10 a 5000).\n\nEx: 120 (fraco), 300 (medio), 900 (forte)");
+            ShowPlayerDialog(playerid, DLG_BANDIDO_HP, DIALOG_STYLE_INPUT,
+                "Vida do NPC", msg2, "OK", "Voltar");
+            return 1;
+        }
+        case DLG_BANDIDO_HP:
+        {
+            if(!response)
+            {
+                new msg[140];
+                format(msg, sizeof msg, "Digite o SkinID do NPC.\n\nSugestao: sua skin atual = %d", GetPlayerSkin(playerid));
+                return ShowPlayerDialog(playerid, DLG_BANDIDO_SKIN, DIALOG_STYLE_INPUT, "SkinID", msg, "OK", "Voltar"), 1;
+            }
+
+            if(strlen(inputtext) < 1)
+                return ShowPlayerDialog(playerid, DLG_BANDIDO_HP, DIALOG_STYLE_INPUT,
+                    "Vida do NPC", "Digite um numero (10 a 5000).", "OK", "Voltar"), 1;
+
+            new hp = strval(inputtext);
+            if(hp < 10 || hp > 5000)
+                return ShowPlayerDialog(playerid, DLG_BANDIDO_HP, DIALOG_STYLE_INPUT,
+                    "Vida do NPC", "Vida invalida. Use um valor entre 10 e 5000.", "OK", "Voltar"), 1;
+
+            gBMenuHP[playerid] = float(hp);
 
             ShowPlayerDialog(playerid, DLG_BANDIDO_PERSONA, DIALOG_STYLE_INPUT,
                 "Persona (jeito de falar)",
@@ -692,6 +765,7 @@ stock BandidoMenu_OnDialog(playerid, dialogid, response, listitem, inputtext[])
             return 1;
         }
         case DLG_BANDIDO_PERSONA:
+
         {
             if(response && strlen(inputtext) >= 2)
                 format(gBMenuPersona[playerid], sizeof gBMenuPersona[], "%s", inputtext);
@@ -750,6 +824,7 @@ stock BandidoMenu_OnDialog(playerid, dialogid, response, listitem, inputtext[])
 
             Bandido_Create(slot,
                 gBMenuSkin[playerid],
+                gBMenuHP[playerid],
                 gBMenuName[playerid],
                 gBMenuMember[playerid],
                 gBMenuPersona[playerid],
@@ -882,7 +957,7 @@ public Bandido_TalkHttp(playerid, response_code, data[])
 
     if(response_code != 200 || !data[0])
     {
-        Bandido_SayNear(slot, "Tô sem chakra pra pensar agora... tenta de novo.", 18.0);
+        Bandido_SayNear(slot, "T sem chakra pra pensar agora... tenta de novo.", 18.0);
         return 1;
     }
 

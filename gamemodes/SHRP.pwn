@@ -39251,10 +39251,19 @@ function SistemaBandanaIDStatus(playerid)
     // se for NPC e n?o for bandido, ignora pra n?o criar label desnecess?rio
     if(IsPlayerNPC(playerid))
     {
+        // Permite TAG em NPCs apenas se forem:
+        // - bandidos do sistema antigo (Bandido_IsBandidoPlayer)
+        // - NPCs de combate do shinobi_ai (clones/guards/mobs)
+        new bool:ok = false;
         if(funcidx("Bandido_IsBandidoPlayer") != -1)
         {
-            if(CallLocalFunction("Bandido_IsBandidoPlayer", "i", playerid) == 0) return 1;
+            if(CallLocalFunction("Bandido_IsBandidoPlayer", "i", playerid) == 1) ok = true;
         }
+        if(!ok && funcidx("SHRP_NpcAI_IsCombatNPC_Public") != -1)
+        {
+            if(CallLocalFunction("SHRP_NpcAI_IsCombatNPC_Public", "i", playerid) == 1) ok = true;
+        }
+        if(!ok) return 1;
     }
 
     new Vila[64], status[64];
@@ -45336,8 +45345,13 @@ function ClearJutsu(playerid)
 // Mantm a assinatura antiga para no quebrar nada do servidor
 stock IsPlayerHittable(playerid)
 {
-    return IsPlayerHittableEx(playerid, false); // por padro: NO permite NPC
+    #if defined SHRP_NpcAI_IsCombatNPC
+        return IsPlayerHittableEx(playerid, SHRP_NpcAI_IsCombatNPC(playerid));
+    #else
+        return IsPlayerHittableEx(playerid, false); // por padrão: NO permite NPC
+    #endif
 }
+
 
 // Nova verso com flag pra permitir NPC quando necessrio
 stock IsPlayerHittableEx(playerid, bool:allowNpc)
@@ -55310,6 +55324,10 @@ function RemoverEscolha(playerid)
 public OnPlayerTakeDamage(playerid, issuerid, Float: amount, weaponid)
 {
     SetPlayerHealth(playerid, 100);
+    // Notifica o AI de NPCs (guards/clones) para retaliar quando o dono toma dano
+    #if defined SHRP_NpcAI_OnPlayerDamaged
+        if(issuerid != INVALID_PLAYER_ID) SHRP_NpcAI_OnPlayerDamaged(playerid, issuerid, amount);
+    #endif
     if(IsPlayerConnected(playerid))
     {
         VidaBar(playerid);
@@ -63654,6 +63672,17 @@ new Float:z = vz - 1.20; // << o 18707 precisa compensar pra baixo
 //Taijutu
 HitPlayer(playerid, victimid, hit, bool:protected)
 {
+    // -------------------------------------------------
+    // Anti friendly-fire para clones (Kage Bunshin)
+    // - Dono nao pode bater no clone
+    // - Clone nao pode bater no dono
+    // -------------------------------------------------
+    if(funcidx("SHRP_NpcAI_IsOwnedBy") != -1)
+    {
+        if(IsPlayerNPC(victimid) && CallLocalFunction("SHRP_NpcAI_IsOwnedBy", "ii", victimid, playerid) == 1) return 0;
+        if(IsPlayerNPC(playerid) && CallLocalFunction("SHRP_NpcAI_IsOwnedBy", "ii", playerid, victimid) == 1) return 0;
+    }
+
     if(Invunerable[victimid] == 1) return 0;
     if(protected) {ProtectedSound(victimid, hit);
         if(Info[playerid][pClan] == 4 && DefesaH[victimid][defesaHit] >= 7){//Quebra defesa Hyuuga
@@ -79457,4 +79486,3 @@ public FimTornado(playerid)
 #include "Includes\Mundo\nnrp_msb_cooldowns.pwn"
 
 #include "Includes\Faccoes\shrp_guerra.pwn"
-
