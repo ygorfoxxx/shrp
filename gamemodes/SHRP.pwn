@@ -40688,6 +40688,17 @@ CMD:testejutsu3(playerid)
     return 1;
 }
 
+// === Bisturi Jutsu
+CMD:mesu(playerid, params[])
+{
+    // se quiser bloquear NPC:
+    // if(IsPlayerNPC(playerid)) return 1;
+
+    MesuChakra(playerid);
+    return 1;
+}
+
+
 CMD:testejutsu5(playerid)
 {
 
@@ -63682,6 +63693,14 @@ HitPlayer(playerid, victimid, hit, bool:protected)
         if(IsPlayerNPC(victimid) && CallLocalFunction("SHRP_NpcAI_IsOwnedBy", "ii", victimid, playerid) == 1) return 0;
         if(IsPlayerNPC(playerid) && CallLocalFunction("SHRP_NpcAI_IsOwnedBy", "ii", playerid, victimid) == 1) return 0;
     }
+    
+    // Clone x Clone: se os dois NPCs forem do MESMO dono, bloqueia o hit (evita friendly-fire)
+	if(funcidx("SHRP_NpcAI_SameOwner") != -1)
+	{
+	    if(IsPlayerNPC(playerid) && IsPlayerNPC(victimid) && CallLocalFunction("SHRP_NpcAI_SameOwner", "ii", playerid, victimid) == 1) return 0;
+	}
+
+
 
     if(Invunerable[victimid] == 1) return 0;
     if(protected) {ProtectedSound(victimid, hit);
@@ -63914,6 +63933,23 @@ TeclarUtilizarCombo(playerid, newkeys, oldkeys)
 
 function HitPlayerInconsciente(playerid, victimid, hit, bool:protected)
 {
+
+    // -------------------------------------------------
+	// Anti friendly-fire para clones (Kage Bunshin)
+	// - Dono nao pode bater no clone
+	// - Clone nao pode bater no dono
+	// - Clone nao pode bater em outro clone do mesmo dono
+	// -------------------------------------------------
+	if(funcidx("SHRP_NpcAI_IsOwnedBy") != -1)
+	{
+	    if(IsPlayerNPC(victimid) && CallLocalFunction("SHRP_NpcAI_IsOwnedBy", "ii", victimid, playerid) == 1) return 0;
+	    if(IsPlayerNPC(playerid) && CallLocalFunction("SHRP_NpcAI_IsOwnedBy", "ii", playerid, victimid) == 1) return 0;
+	}
+	if(funcidx("SHRP_NpcAI_SameOwner") != -1)
+	{
+	    if(IsPlayerNPC(playerid) && IsPlayerNPC(victimid) && CallLocalFunction("SHRP_NpcAI_SameOwner", "ii", playerid, victimid) == 1) return 0;
+	}
+
     if(protected) return ProtectedSound(victimid, hit);
     _CCHit(victimid);
     ClearSelo(victimid);
@@ -78517,7 +78553,7 @@ function MesuChakra(playerid)
     }
     return 1;
 }
-#define SAPO_COOLDOWN 900
+#define SAPO_COOLDOWN 0
 #define SAPO_TIMING   100000    // 20 segundos de dura??o do jutsu
 
 enum dataSapoInvocacao

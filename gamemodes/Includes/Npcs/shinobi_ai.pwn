@@ -52,6 +52,7 @@ new gNpcState[MAXIMO_NPCS_COMBATE];
 new gNpcOwner[MAXIMO_NPCS_COMBATE];         // dono (para guard/clone). INVALID_PLAYER_ID se nenhum
 new gNpcTarget[MAXIMO_NPCS_COMBATE];        // alvo atual. INVALID_PLAYER_ID se nenhum
 new gNpcVila[MAXIMO_NPCS_COMBATE];          // vila/faccao do NPC (use seu id de vila)
+new bool:gNpcTagEnabled[MAXIMO_NPCS_COMBATE]; // controla se o SistemaBandanaIDStatus pode criar tag/label para este NPC
 
 new Float:gNpcHome[MAXIMO_NPCS_COMBATE][3]; // ponto-base (spawn)
 new gNpcVW[MAXIMO_NPCS_COMBATE];
@@ -172,6 +173,9 @@ public SHRP_NpcAI_RegisterExisting(npcid, npctype, vila, Float:x, Float:y, Float
     gNpcOwner[slot] = INVALID_PLAYER_ID;
     gNpcTarget[slot] = INVALID_PLAYER_ID;
     gNpcVila[slot] = vila;
+    // Bandana/Aliança: NPC herda a vila (label e lógica de facção)
+    Info[npcid][pMember] = vila;
+    if(funcidx("SistemaBandanaIDStatus") != -1) CallLocalFunction("SistemaBandanaIDStatus", "i", npcid);
     gNpcHome[slot][0] = x;
     gNpcHome[slot][1] = y;
     gNpcHome[slot][2] = z;
@@ -199,6 +203,9 @@ public SHRP_NpcAI_RegisterExisting(npcid, npctype, vila, Float:x, Float:y, Float
 
     // map reverse
     gNpcSlotByPlayer[npcid] = slot;
+
+    // Tag/Label (SistemaBandanaIDStatus) - habilitado por padrão; pode ser desligado (ex: bunshin sem nametag)
+    gNpcTagEnabled[slot] = true;
 
     // Garantir VW/Int do NPC
     SetPlayerVirtualWorld(npcid, vw);
@@ -258,12 +265,37 @@ public SHRP_NpcAI_IsOwnedBy(npcid, ownerid)
     return (gNpcOwner[slot] == ownerid);
 }
 
+
+
+// Retorna o owner do NPC (ou INVALID_PLAYER_ID se nao for NPC do shinobi_ai)
+public SHRP_NpcAI_GetOwner(npcid)
+{
+    new slot = SHRP_NpcSlotFromId(npcid);
+    if(slot == -1 || !gNpcUsed[slot] || gNpcId[slot] != npcid) return INVALID_PLAYER_ID;
+    return gNpcOwner[slot];
+}
+
+// Retorna 1 se dois NPCs forem do MESMO dono (e o dono nao for INVALID)
+public SHRP_NpcAI_SameOwner(npcid1, npcid2)
+{
+    new slot1 = SHRP_NpcSlotFromId(npcid1);
+    if(slot1 == -1 || !gNpcUsed[slot1] || gNpcId[slot1] != npcid1) return 0;
+
+    new slot2 = SHRP_NpcSlotFromId(npcid2);
+    if(slot2 == -1 || !gNpcUsed[slot2] || gNpcId[slot2] != npcid2) return 0;
+
+    new owner1 = gNpcOwner[slot1];
+    if(owner1 == INVALID_PLAYER_ID) return 0;
+
+    return (owner1 == gNpcOwner[slot2]);
+}
+
 // Retorna 1 se o id for um NPC gerenciado pelo shinobi_ai (mob/guard/patrol)
 public SHRP_NpcAI_IsCombatNPC_Public(playerid)
 {
     new slot = SHRP_NpcSlotFromId(playerid);
     if(slot == -1 || !gNpcUsed[slot] || gNpcId[slot] != playerid) return 0;
-    return 1;
+    return (gNpcTagEnabled[slot]) ? 1 : 0;
 }
 
 
@@ -335,6 +367,7 @@ stock SHRP_NpcResetSlot(slot)
     gNpcOwner[slot] = INVALID_PLAYER_ID;
     gNpcTarget[slot] = INVALID_PLAYER_ID;
     gNpcVila[slot] = 0;
+    gNpcTagEnabled[slot] = false;
 
     gNpcHome[slot][0] = 0.0;
     gNpcHome[slot][1] = 0.0;
@@ -441,9 +474,17 @@ stock SHRP_NpcCreate(const name[], skin, type, vila, Float:x, Float:y, Float:z, 
     gNpcId[slot] = npcid;
     gNpcSlotByPlayer[npcid] = slot;
 
+    // Tag/Label (SistemaBandanaIDStatus) - habilitado por padrão; pode ser desligado (ex: bunshin sem nametag)
+    gNpcTagEnabled[slot] = true;
+
     // stats base (pra dano de taijutsu funcionar mesmo sem template)
     Info[npcid][pTaijutsu] = 50;
 
+    // Bandana/Aliança: NPC herda a vila para aparecer corretamente no SistemaBandanaIDStatus
+    Info[npcid][pMember] = vila;
+
+    // Garante que o label/tag seja criado mesmo se o OnPlayerConnect do NPC foi ignorado
+    if(funcidx("SistemaBandanaIDStatus") != -1) CallLocalFunction("SistemaBandanaIDStatus", "i", npcid);
     gNpcType[slot] = type;
 
     // cooldown de ataque por tipo (ajuste fino aqui se quiser)
@@ -534,6 +575,32 @@ stock SHRP_NpcSetOwner(slot, ownerid, Float:followDist = 2.5)
     gNpcState[slot] = NPCS_FOLLOW;
     return 1;
 }
+
+// Habilita/Desabilita a nametag (label 3D) para este NPC.
+// - Quando desabilitado, o SistemaBandanaIDStatus vai ignorar esse NPC (via SHRP_NpcAI_IsCombatNPC_Public)
+// - Útil para Bunshin: same nome/vila, mas sem nametag se você quiser
+stock SHRP_NpcSetTagEnabled(slot, bool:enable)
+{
+    if (slot < 0 || slot >= MAXIMO_NPCS_COMBATE) return 0;
+    if (!gNpcUsed[slot]) return 0;
+
+    gNpcTagEnabled[slot] = enable;
+
+    new npcid = gNpcId[slot];
+    if (npcid != INVALID_PLAYER_ID)
+    {
+        if (!enable)
+        {
+            if (funcidx("RemoverBSN") != -1) CallLocalFunction("RemoverBSN", "i", npcid);
+        }
+        else
+        {
+            if (funcidx("SistemaBandanaIDStatus") != -1) CallLocalFunction("SistemaBandanaIDStatus", "i", npcid);
+        }
+    }
+    return 1;
+}
+
 
 stock SHRP_NpcSetJutsu(slot, const cmdName[], bool:needsTarget = false, cooldownMs = 5000)
 {
@@ -672,6 +739,9 @@ stock SHRP_NpcPickTarget(slot)
         if (p == npcid) continue;
         // clones/guards: nunca atacar o dono
         if (gNpcOwner[slot] != INVALID_PLAYER_ID && p == gNpcOwner[slot]) continue;
+
+        // clones/guards: nunca atacar outros NPCs do mesmo dono (ex: Kage Bunshin)
+        if (gNpcOwner[slot] != INVALID_PLAYER_ID && IsPlayerNPC(p) && SHRP_NpcAI_IsOwnedBy(p, gNpcOwner[slot])) continue;
         if (GetPlayerVirtualWorld(p) != gNpcVW[slot]) continue;
         if (GetPlayerInterior(p) != gNpcInt[slot]) continue;
 
@@ -727,6 +797,9 @@ stock SHRP_NpcDoMelee(slot, targetid)
     // clones/guards: nunca bater no dono
     if (gNpcOwner[slot] != INVALID_PLAYER_ID && targetid == gNpcOwner[slot]) return 0;
 
+
+    // clones/guards: nunca bater em outro NPC do mesmo dono (evita clone vs clone)
+    if (gNpcOwner[slot] != INVALID_PLAYER_ID && IsPlayerNPC(targetid) && SHRP_NpcAI_IsOwnedBy(targetid, gNpcOwner[slot])) return 0;
     new now = GetTickCount();
     if (now - gNpcLastAttackTick[slot] < gNpcAttackCooldownMs[slot]) return 0; // cooldown
     gNpcLastAttackTick[slot] = now;
@@ -816,7 +889,11 @@ public SHRP_NpcAI_Tick()
                 new Float:d = SHRP_Dist3D(nx, ny, nz, ox, oy, oz);
                 if (d > gNpcFollowDist[slot] + 0.8)
                 {
-                    FCNPC_GoToPlayer(npcid, owner);
+                    // segue em 2D (mantém Z do próprio NPC, não tenta subir/voar)
+                    new Float:tx, Float:ty, Float:tz;
+                    GetPlayerPos(owner, tx, ty, tz);
+                    tz = nz; // trava no chão do NPC
+                    FCNPC_GoTo(npcid, tx, ty, tz);
                 }
                 else
                 {
@@ -852,6 +929,15 @@ public SHRP_NpcAI_Tick()
 
             new target = gNpcTarget[slot];
 
+
+            // Guard/Clone: se por algum motivo o alvo virou outro clone do mesmo dono, limpa (evita "clones se batendo")
+            if (gNpcType[slot] == NPCT_GUARD && gNpcOwner[slot] != INVALID_PLAYER_ID && IsPlayerNPC(target) && SHRP_NpcAI_IsOwnedBy(target, gNpcOwner[slot]))
+            {
+                gNpcTarget[slot] = INVALID_PLAYER_ID;
+                gNpcState[slot] = NPCS_FOLLOW;
+                FCNPC_Stop(npcid);
+                continue;
+            }
             new Float:nx, Float:ny, Float:nz;
             FCNPC_GetPosition(npcid, nx, ny, nz);
 
@@ -878,7 +964,13 @@ public SHRP_NpcAI_Tick()
 
             if (d2 > gNpcAttackRange[slot] || dz > 1.8)
             {
-                FCNPC_GoToPlayer(npcid, target);
+                // persegue em 2D (mantém Z do próprio NPC, não tenta subir/voar)
+                new Float:tx, Float:ty, Float:tz;
+                GetPlayerPos(target, tx, ty, tz);
+                new Float:nx2, Float:ny2, Float:nz2;
+                FCNPC_GetPosition(npcid, nx2, ny2, nz2);
+                tz = nz2; // trava no chão do NPC
+                FCNPC_GoTo(npcid, tx, ty, tz);
             }
             else
             {

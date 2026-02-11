@@ -32,12 +32,16 @@
 #define DLG_MENUNPC_REMOVE_CONFIRM (24504)
 #define DLG_MENUNPC_SET_SKIN      (24505)
 #define DLG_MENUNPC_SET_HP        (24506)
+#define DLG_MENUNPC_XP_LIST       (24507)
+#define DLG_MENUNPC_XP_SET        (24508)
 
+#define DLG_MENUNPC_BUN_LIST     (6612)
+#define DLG_MENUNPC_BUN_SET      (6613)
 // -------------------- CONFIG --------------------
 #define MENUNPC_MAX_SPAWNS        (120)
 
 // clones
-#define BUNSHIN_MAX_CLONES        (2)
+#define BUNSHIN_MAX_CLONES        (6)
 #define BUNSHIN_LIFETIME_MS       (45000)
 #define BUNSHIN_COOLDOWN_MS       (20000)
 #define BUNSHIN_CHAKRA_COST       (35.0)
@@ -56,10 +60,12 @@ enum E_MN_SPAWN
     mnType,
     mnTemplate,
     mnVila,
+    mnEcoVila,
     mnSkin,
     Float:mnHPMax,
     mnRespawnMs,
     mnCost,                 // usado em guardas do tesouro
+    mnXPOverride,            // -1 = usa template; >=0 = override de XP do spawn
     Float:mnX,
     Float:mnY,
     Float:mnZ,
@@ -76,6 +82,11 @@ new gMnTimer = -1;
 new gMnListMap[MAX_PLAYERS][MENUNPC_MAX_SPAWNS];
 new gMnListCount[MAX_PLAYERS];
 new gMnPendingRemoveIdx[MAX_PLAYERS];
+
+// XP panel (admin)
+new gMnXpListMap[MAX_PLAYERS][MENUNPC_MAX_SPAWNS];
+new gMnXpListCount[MAX_PLAYERS];
+new gMnXpEditIdx[MAX_PLAYERS];
 
 // pendência de criação (skin)
 new gMnPendingSkinIdx[MAX_PLAYERS];
@@ -94,12 +105,31 @@ new gBunshinSpawnSkin[MAX_PLAYERS];
 new gBunshinExpireTick[MAX_PLAYERS];
 new gBunshinNextUseTick[MAX_PLAYERS];
 
+// permissão/limite do Bunshin (controlado por ADMIN)
+new gBunshinGranted[MAX_PLAYERS];          // 0 = não tem, 1 = liberado
+new gBunshinGrantedMax[MAX_PLAYERS];       // limite liberado (admin)
+new gBunshinToSpawn[MAX_PLAYERS];          // quantidade que vai spawnar no cast atual
+
+// Painel Bunshin (Admin)
+new gMnBunListCount[MAX_PLAYERS];
+new gMnBunListMap[MAX_PLAYERS][MAX_PLAYERS]; // listitem -> targetid
+new gMnBunTarget[MAX_PLAYERS];
+
+
 // -------------------- ACCESS (AJUSTE AQUI) --------------------
 stock bool:MenuNpc_CanUse(playerid)
 {
     // Sugestão: restringir pra staff.
     // Ex.: return (Info[playerid][pAdmin] >= 1);
     return true;
+}
+
+stock bool:MenuNpc_IsAdmin(playerid)
+{
+    // Ajuste se seu GM usar outro nível.
+    // pAdminZC existe no SHRP.
+    if(IsPlayerAdmin(playerid)) return true; // RCON
+    return (Info[playerid][pAdminZC] >= 1);
 }
 
 stock bool:MenuNpc_IsKage(playerid)
@@ -137,10 +167,12 @@ stock Mn_ResetSpawn(i)
     gMnSpawn[i][mnType] = SPAWN_NONE;
     gMnSpawn[i][mnTemplate] = 0;
     gMnSpawn[i][mnVila] = 0;
+    gMnSpawn[i][mnEcoVila] = 0;
     gMnSpawn[i][mnSkin] = 0;
     gMnSpawn[i][mnHPMax] = 0.0;
     gMnSpawn[i][mnRespawnMs] = 0;
     gMnSpawn[i][mnCost] = 0;
+    gMnSpawn[i][mnXPOverride] = -1;
     gMnSpawn[i][mnX] = 0.0;
     gMnSpawn[i][mnY] = 0.0;
     gMnSpawn[i][mnZ] = 0.0;
@@ -236,8 +268,8 @@ stock Mn_SpawnNow(i)
     if(Mn_IsAliveSlot(gMnSpawn[i][mnActiveSlot])) return 1;
 
     new name[32];
-    if(gMnSpawn[i][mnType] == SPAWN_MOB) format(name, sizeof name, "Mob_%d", i);
-    else                                  format(name, sizeof name, "Guarda_%d", i);
+    if(gMnSpawn[i][mnType] == SPAWN_MOB) format(name, sizeof name, "Mob%d", i);
+    else                                  format(name, sizeof name, "Guarda%d", i);
 
     new type = (gMnSpawn[i][mnType] == SPAWN_GUARD) ? NPCT_PATROL : NPCT_HOSTILE;
     new vila = gMnSpawn[i][mnVila];
@@ -262,6 +294,12 @@ stock Mn_SpawnNow(i)
 
     // Override de VIDA definido no menu
     if(gMnSpawn[i][mnHPMax] > 0.0) SHRP_NpcSetHP(slot, gMnSpawn[i][mnHPMax]);
+
+    // Override de XP (somente staff deve setar via /npcxp)
+    if(gMnSpawn[i][mnXPOverride] >= 0)
+    {
+        gNpcXPReward[slot] = gMnSpawn[i][mnXPOverride];
+    }
 
     return 1;
 }
@@ -293,7 +331,7 @@ public Mn_Tick()
 
         if(gBunshinExpireTick[p] != 0 && now > gBunshinExpireTick[p])
         {
-            for(new c=0; c<BUNSHIN_MAX_CLONES; c++)
+            for(new c=0; c<gBunshinToSpawn[p]; c++)
             {
                 new slot = gBunshinSlots[p][c];
                 if(Mn_IsAliveSlot(slot)) SHRP_NpcDestroy(slot);
@@ -314,12 +352,19 @@ stock MenuNpc_Init()
     {
         gMnPendingRemoveIdx[p] = -1;
         gMnListCount[p] = 0;
+        gMnXpEditIdx[p] = -1;
+        gMnXpListCount[p] = 0;
         gMnPendingSkinIdx[p] = -1;
         gMnPendingSkinIsGuard[p] = false;
 
         for(new c=0; c<BUNSHIN_MAX_CLONES; c++) gBunshinSlots[p][c] = -1;
         gBunshinExpireTick[p] = 0;
         gBunshinNextUseTick[p] = 0;
+        gBunshinGranted[p] = 0;
+        gBunshinGrantedMax[p] = 0;
+        gBunshinToSpawn[p] = 0;
+        gMnBunListCount[p] = 0;
+        gMnBunTarget[p] = INVALID_PLAYER_ID;
     }
 
     if(gMnTimer != -1) KillTimer(gMnTimer);
@@ -350,6 +395,8 @@ stock MenuNpc_ShowMain(playerid)
     strcat(list, "Criar MOB aqui (pra upar)\n");
     strcat(list, "Criar GUARDA de portão (Kage / Tesouro)\n");
     strcat(list, "Gerenciar spawns (remover)\n");
+    strcat(list, "Painel XP (ADMIN)\n");
+    strcat(list, "Painel Bunshin (ADMIN)\n");
     strcat(list, "Criar NPC FALANTE (wizard bandidos)\n");
 
 #if defined _ECO_CORE_INCLUDED
@@ -462,12 +509,185 @@ stock MenuNpc_ShowSpawnList(playerid)
     return 1;
 }
 
+// -------------------- XP PANEL (ADMIN) --------------------
+stock Mn_GetDefaultXpBySpawn(spawnid)
+{
+    if(spawnid < 0 || spawnid >= MENUNPC_MAX_SPAWNS || !gMnSpawn[spawnid][mnUsed]) return 0;
+
+    if(gMnSpawn[spawnid][mnType] == SPAWN_MOB)
+    {
+        switch(gMnSpawn[spawnid][mnTemplate])
+        {
+            case MOB_TPL_FRACO: return 35;
+            case MOB_TPL_MEDIO: return 65;
+            case MOB_TPL_BOSS:  return 260;
+        }
+        return 35;
+    }
+    // Guard/Patrulha por padrão não dá XP
+    return 0;
+}
+
+stock MenuNpc_BuildXpList(playerid, out[], outSize)
+{
+    out[0] = '\0';
+    strcat(out, "ID\tTipo\tXP Atual\n", outSize);
+
+    gMnXpListCount[playerid] = 0;
+
+    for(new i=0; i<MENUNPC_MAX_SPAWNS; i++)
+    {
+        if(!gMnSpawn[i][mnUsed]) continue;
+
+        new typeName[12];
+        if(gMnSpawn[i][mnType] == SPAWN_MOB) format(typeName, sizeof typeName, "MOB");
+        else format(typeName, sizeof typeName, "GUARDA");
+
+        new defxp = Mn_GetDefaultXpBySpawn(i);
+        new curxp = (gMnSpawn[i][mnXPOverride] >= 0) ? gMnSpawn[i][mnXPOverride] : defxp;
+
+        new line[128];
+        if(gMnSpawn[i][mnXPOverride] >= 0)
+            format(line, sizeof line, "%d\t%s\t%d (override)\n", i, typeName, curxp);
+        else
+            format(line, sizeof line, "%d\t%s\t%d (padrao)\n", i, typeName, curxp);
+
+        strcat(out, line, outSize);
+
+        gMnXpListMap[playerid][gMnXpListCount[playerid]++] = i;
+        if(gMnXpListCount[playerid] >= MENUNPC_MAX_SPAWNS) break;
+    }
+
+    if(gMnXpListCount[playerid] == 0)
+        strcat(out, "\t(sem spawns)\t\n", outSize);
+
+    return 1;
+}
+
+stock MenuNpc_ShowXpPanel(playerid)
+{
+    if(!MenuNpc_IsAdmin(playerid))
+        return SendClientMessage(playerid, -1, "Somente administrador pode editar XP de MOB/NPC."), 1;
+
+    new list[2048];
+    MenuNpc_BuildXpList(playerid, list, sizeof list);
+
+    ShowPlayerDialog(playerid, DLG_MENUNPC_XP_LIST, DIALOG_STYLE_TABLIST_HEADERS,
+        "Painel XP (Admin)", list, "Editar", "Voltar");
+    return 1;
+}
+
+stock MenuNpc_ShowBunPanel(playerid)
+{
+    if(!MenuNpc_IsAdmin(playerid)) return MenuNpc_ShowMain(playerid);
+
+    new list[4096];
+    format(list, sizeof list, "Player\tClones\n");
+
+    gMnBunListCount[playerid] = 0;
+
+    foreach(Player, i)
+    {
+        if(!IsPlayerConnected(i) || IsPlayerNPC(i)) continue;
+        if(gMnBunListCount[playerid] >= MAX_PLAYERS) break;
+
+        new nome[MAX_PLAYER_NAME];
+        GetPlayerName(i, nome, sizeof nome);
+
+        new cur = (gBunshinGranted[i]) ? gBunshinGrantedMax[i] : 0;
+
+        new linha[128];
+        format(linha, sizeof linha, "%s (%d)\t%d\n", nome, i, cur);
+        strcat(list, linha);
+
+        gMnBunListMap[playerid][gMnBunListCount[playerid]++] = i;
+    }
+
+    ShowPlayerDialog(playerid, DLG_MENUNPC_BUN_LIST, DIALOG_STYLE_TABLIST_HEADERS,
+        "Painel Bunshin (Admin)", list, "Editar", "Voltar");
+    return 1;
+}
+
+
+stock MenuNpc_ShowSetXP(playerid, spawnid)
+{
+    new defxp = Mn_GetDefaultXpBySpawn(spawnid);
+    new curxp = (gMnSpawn[spawnid][mnXPOverride] >= 0) ? gMnSpawn[spawnid][mnXPOverride] : defxp;
+
+    new txt[256];
+    format(txt, sizeof txt,
+        "Spawn %d\n\nXP atual: %d\nXP padrão do template: %d\n\nDigite o XP.\nUse -1 para voltar ao padrão.",
+        spawnid, curxp, defxp);
+
+    ShowPlayerDialog(playerid, DLG_MENUNPC_XP_SET, DIALOG_STYLE_INPUT,
+        "Definir XP", txt, "Salvar", "Voltar");
+    return 1;
+}
+
 // -------------------- COMMAND --------------------
 CMD:menunpc(playerid, params[])
 {
     if(!MenuNpc_CanUse(playerid)) return SendClientMessage(playerid, -1, "Sem permissao."), 1;
     return MenuNpc_ShowMain(playerid);
 }
+
+
+CMD:npcxp(playerid, params[])
+{
+    if(!MenuNpc_IsAdmin(playerid))
+        return SendClientMessage(playerid, -1, "Somente administrador pode definir XP de MOB/NPC."), 1;
+
+    new idx = 0;
+    new tok[32];
+
+    if(!Mn_NextTok(params, idx, tok, sizeof tok))
+        return SendClientMessage(playerid, -1, "Uso: /npcxp <spawnId|npcid> <xp>"), 1;
+
+    new id = strval(tok);
+
+    if(!Mn_NextTok(params, idx, tok, sizeof tok))
+        return SendClientMessage(playerid, -1, "Uso: /npcxp <spawnId|npcid> <xp>"), 1;
+
+    new xp = strval(tok);
+    // Use -1 para voltar ao XP padrão do template (somente spawns do /menunpc)
+    if(xp < 0) xp = -1;
+    if(xp > 5000) xp = 5000;
+
+    // 1) Se for um SPAWN do /menunpc
+    if(id >= 0 && id < MENUNPC_MAX_SPAWNS && gMnSpawn[id][mnUsed])
+    {
+        gMnSpawn[id][mnXPOverride] = xp;
+
+        new slot = gMnSpawn[id][mnActiveSlot];
+        if(Mn_IsAliveSlot(slot))
+        {
+            new defxp = Mn_GetDefaultXpBySpawn(id);
+            new finalxp = (xp >= 0) ? xp : defxp;
+            gNpcXPReward[slot] = finalxp;
+        }
+
+        new msg[96];
+        format(msg, sizeof msg, "XP do spawn %d setado para %d.", id, xp);
+        SendClientMessage(playerid, -1, msg);
+        return 1;
+    }
+
+    // 2) Fallback: setar no NPC vivo (não persiste)
+    #if defined SHRP_NpcSlotFromId
+        new slot2 = SHRP_NpcSlotFromId(id);
+        if(slot2 != -1 && Mn_IsAliveSlot(slot2))
+        {
+            gNpcXPReward[slot2] = (xp >= 0) ? xp : 0;
+            new msg2[128];
+            format(msg2, sizeof msg2, "XP aplicado no NPC %d (slot %d) para %d (nao persiste em respawn).", id, slot2, xp);
+            SendClientMessage(playerid, -1, msg2);
+            return 1;
+        }
+    #endif
+
+    return SendClientMessage(playerid, -1, "ID invalido. Use um spawnId do /menunpc (lista) ou um npcid vivo."), 1;
+}
+
 
 // -------------------- DIALOG HANDLER --------------------
 // No GM: if(MenuNpc_OnDialog(...)) return 1;
@@ -484,7 +704,9 @@ stock MenuNpc_OnDialog(playerid, dialogid, response, listitem, inputtext[])
                 case 0: return MenuNpc_ShowMobTpl(playerid);
                 case 1: return MenuNpc_ShowGuardTpl(playerid);
                 case 2: return MenuNpc_ShowSpawnList(playerid);
-                case 3: return BandidoMenu_Start(playerid);
+                case 3: return MenuNpc_ShowXpPanel(playerid);
+                case 4: return MenuNpc_ShowBunPanel(playerid);
+                case 5: return BandidoMenu_Start(playerid);
             }
             return 1;
         }
@@ -508,10 +730,12 @@ stock MenuNpc_OnDialog(playerid, dialogid, response, listitem, inputtext[])
             gMnSpawn[idx][mnType] = SPAWN_MOB;
             gMnSpawn[idx][mnTemplate] = tpl;
             gMnSpawn[idx][mnVila] = 0; // mob ataca todos
+            gMnSpawn[idx][mnEcoVila] = 0;
             gMnSpawn[idx][mnSkin] = 105; // skin padrão (pode trocar no próximo dialog)
             gMnSpawn[idx][mnHPMax] = (tpl == MOB_TPL_FRACO) ? 120.0 : (tpl == MOB_TPL_MEDIO) ? 220.0 : 450.0;
             gMnSpawn[idx][mnRespawnMs] = respawn;
             gMnSpawn[idx][mnCost] = 0;
+            gMnSpawn[idx][mnXPOverride] = -1;
 
             gMnSpawn[idx][mnX] = x; gMnSpawn[idx][mnY] = y; gMnSpawn[idx][mnZ] = z;
             gMnSpawn[idx][mnVW] = GetPlayerVirtualWorld(playerid);
@@ -533,13 +757,17 @@ stock MenuNpc_OnDialog(playerid, dialogid, response, listitem, inputtext[])
                 return SendClientMessage(playerid, -1, "Somente o Kage pode contratar guardas pelo tesouro."), 1;
 
             #if defined _ECO_CORE_INCLUDED
-            new vila = Eco_GetKageVilaFromPlayer(playerid);
-            if(vila <= 0) return SendClientMessage(playerid, -1, "Você não tem vila válida."), 1;
+            new ecoVila = Eco_GetKageVilaFromPlayer(playerid);
+            if(ecoVila <= 0) return SendClientMessage(playerid, -1, "Você não tem vila válida."), 1;
+
+            // Bandana / vila do Kage (usa o mesmo ID do SistemaBandanaIDStatus)
+            new bandanaVila = Info[playerid][pMember];
+            if(bandanaVila < 1 || bandanaVila > 5) return SendClientMessage(playerid, -1, "Sua bandana/vila está inválida para contratar guardas."), 1;
 
             new tpl = (listitem == 0) ? GUARD_TPL_GATE : GUARD_TPL_PATROL;
             new cost = (tpl == GUARD_TPL_GATE) ? 2000 : 3000;
 
-            if(gEcoTreasury[vila] < cost)
+            if(gEcoTreasury[ecoVila] < cost)
                 return SendClientMessage(playerid, -1, "Tesouro insuficiente."), 1;
 
             new idx = Mn_FindFreeSpawn();
@@ -549,18 +777,20 @@ stock MenuNpc_OnDialog(playerid, dialogid, response, listitem, inputtext[])
             GetPlayerPos(playerid, x, y, z);
 
             // reserva o spawn e cobra do tesouro (se cancelar, devolve)
-            gEcoTreasury[vila] -= cost;
+            gEcoTreasury[ecoVila] -= cost;
 
             gMnSpawn[idx][mnUsed] = true;
             gMnSpawn[idx][mnPendingSkin] = true;
             gMnSpawn[idx][mnPendingHP] = false;
             gMnSpawn[idx][mnType] = SPAWN_GUARD;
             gMnSpawn[idx][mnTemplate] = tpl;
-            gMnSpawn[idx][mnVila] = vila;     // guarda ignora mesma vila e ataca invasores
+            gMnSpawn[idx][mnVila] = bandanaVila;     // guarda ignora mesma vila (bandana) e ataca invasores
+            gMnSpawn[idx][mnEcoVila] = ecoVila;      // tesouro/eco (índice da eco_core)
             gMnSpawn[idx][mnSkin] = 287;      // skin padrão
             gMnSpawn[idx][mnHPMax] = (tpl == GUARD_TPL_GATE) ? 320.0 : 280.0;
             gMnSpawn[idx][mnRespawnMs] = 60000;
             gMnSpawn[idx][mnCost] = cost;
+             gMnSpawn[idx][mnXPOverride] = -1;
 
             gMnSpawn[idx][mnX] = x; gMnSpawn[idx][mnY] = y; gMnSpawn[idx][mnZ] = z;
             gMnSpawn[idx][mnVW] = GetPlayerVirtualWorld(playerid);
@@ -587,8 +817,8 @@ stock MenuNpc_OnDialog(playerid, dialogid, response, listitem, inputtext[])
             {
                 // cancelou: devolve custo (se for guarda) e apaga
                 #if defined _ECO_CORE_INCLUDED
-                if(gMnPendingSkinIsGuard[playerid] && gMnSpawn[idx][mnCost] > 0 && gMnSpawn[idx][mnVila] > 0)
-                    gEcoTreasury[gMnSpawn[idx][mnVila]] += gMnSpawn[idx][mnCost];
+                if(gMnPendingSkinIsGuard[playerid] && gMnSpawn[idx][mnCost] > 0 && gMnSpawn[idx][mnEcoVila] > 0)
+                    gEcoTreasury[gMnSpawn[idx][mnEcoVila]] += gMnSpawn[idx][mnCost];
                 #endif
 
                 Mn_ResetSpawn(idx);
@@ -626,7 +856,6 @@ stock MenuNpc_OnDialog(playerid, dialogid, response, listitem, inputtext[])
                 // Voltar para escolher a skin novamente (mantém custo reservado se guarda)
                 gMnSpawn[idx][mnPendingHP] = false;
                 gMnSpawn[idx][mnPendingSkin] = true;
-            gMnSpawn[idx][mnPendingHP] = false;
                 return MenuNpc_ShowSetSkin(playerid, gMnSpawn[idx][mnSkin], gMnPendingSkinIsGuard[playerid]);
             }
 
@@ -655,6 +884,123 @@ stock MenuNpc_OnDialog(playerid, dialogid, response, listitem, inputtext[])
             SendClientMessage(playerid, -1, "NPC criado!");
             return 1;
         }
+
+
+
+        case DLG_MENUNPC_XP_LIST:
+        {
+            if(!MenuNpc_IsAdmin(playerid)) return MenuNpc_ShowMain(playerid);
+
+            if(!response) return MenuNpc_ShowMain(playerid);
+            if(gMnXpListCount[playerid] <= 0) return MenuNpc_ShowMain(playerid);
+
+            new idxList = gMnXpListMap[playerid][listitem];
+            if(idxList < 0 || idxList >= MENUNPC_MAX_SPAWNS || !gMnSpawn[idxList][mnUsed])
+                return MenuNpc_ShowXpPanel(playerid);
+
+            gMnXpEditIdx[playerid] = idxList;
+            return MenuNpc_ShowSetXP(playerid, idxList);
+        }
+
+        case DLG_MENUNPC_XP_SET:
+        {
+            if(!MenuNpc_IsAdmin(playerid)) return MenuNpc_ShowMain(playerid);
+
+            new idxList = gMnXpEditIdx[playerid];
+            if(idxList < 0 || idxList >= MENUNPC_MAX_SPAWNS || !gMnSpawn[idxList][mnUsed])
+                return MenuNpc_ShowXpPanel(playerid);
+
+            if(!response) return MenuNpc_ShowXpPanel(playerid);
+
+            if(!strlen(inputtext))
+                return MenuNpc_ShowSetXP(playerid, idxList);
+
+            new xp = strval(inputtext);
+            if(xp < 0)
+            {
+                // volta ao padrão
+                gMnSpawn[idxList][mnXPOverride] = -1;
+            }
+            else
+            {
+                if(xp > 5000) xp = 5000;
+                gMnSpawn[idxList][mnXPOverride] = xp;
+            }
+
+            // aplica imediatamente no NPC vivo (se existir)
+            new slot = gMnSpawn[idxList][mnActiveSlot];
+            if(Mn_IsAliveSlot(slot))
+            {
+                new defxp = Mn_GetDefaultXpBySpawn(idxList);
+                new finalxp = (gMnSpawn[idxList][mnXPOverride] >= 0) ? gMnSpawn[idxList][mnXPOverride] : defxp;
+                gNpcXPReward[slot] = finalxp;
+            }
+
+            SendClientMessage(playerid, -1, "XP atualizado.");
+            return MenuNpc_ShowXpPanel(playerid);
+        }
+
+        case DLG_MENUNPC_BUN_LIST:
+        {
+            if(!MenuNpc_IsAdmin(playerid)) return MenuNpc_ShowMain(playerid);
+            if(!response) return MenuNpc_ShowMain(playerid);
+
+            if(gMnBunListCount[playerid] <= 0) return MenuNpc_ShowMain(playerid);
+            if(listitem < 0 || listitem >= gMnBunListCount[playerid]) return MenuNpc_ShowBunPanel(playerid);
+
+            new targetid = gMnBunListMap[playerid][listitem];
+            if(!IsPlayerConnected(targetid) || IsPlayerNPC(targetid)) return MenuNpc_ShowBunPanel(playerid);
+
+            gMnBunTarget[playerid] = targetid;
+
+            new nome[MAX_PLAYER_NAME];
+            GetPlayerName(targetid, nome, sizeof nome);
+
+            new msg[256];
+            format(msg, sizeof msg,
+                "Defina quantos clones esse player pode usar.\n\n- 0 = revogar\n- 1 = 1 clone\n- 2 = 2 clones (somente Jounin)\n- 3+ = acima de 2 (somente se ADMIN liberar)\n\nPlayer: %s (%d)",
+                nome, targetid);
+
+            ShowPlayerDialog(playerid, DLG_MENUNPC_BUN_SET, DIALOG_STYLE_INPUT,
+                "Bunshin - Quantidade", msg, "Salvar", "Voltar");
+            return 1;
+        }
+
+        case DLG_MENUNPC_BUN_SET:
+        {
+            if(!MenuNpc_IsAdmin(playerid)) return MenuNpc_ShowMain(playerid);
+
+            if(!response) return MenuNpc_ShowBunPanel(playerid);
+
+            new targetid = gMnBunTarget[playerid];
+            if(targetid == INVALID_PLAYER_ID || !IsPlayerConnected(targetid) || IsPlayerNPC(targetid))
+                return MenuNpc_ShowBunPanel(playerid);
+
+            new amount = strval(inputtext);
+            if(amount < 0) amount = 0;
+            if(amount > BUNSHIN_MAX_CLONES) amount = BUNSHIN_MAX_CLONES;
+
+            if(amount == 0)
+            {
+                gBunshinGranted[targetid] = 0;
+                gBunshinGrantedMax[targetid] = 0;
+
+                SendClientMessage(playerid, -1, "Bunshin revogado para o player.");
+                SendClientMessage(targetid, -1, "(JUTSU) Sua permissão de Kage Bunshin foi revogada.");
+                return MenuNpc_ShowBunPanel(playerid);
+            }
+
+            gBunshinGranted[targetid] = 1;
+            gBunshinGrantedMax[targetid] = amount;
+
+            new msg[96];
+            format(msg, sizeof msg, "Bunshin liberado: %d clone(s).", amount);
+            SendClientMessage(playerid, -1, msg);
+            SendClientMessage(targetid, -1, "(JUTSU) Você recebeu permissão para usar Kage Bunshin.");
+
+            return MenuNpc_ShowBunPanel(playerid);
+        }
+
 
 
         case DLG_MENUNPC_LIST:
@@ -705,6 +1051,7 @@ stock Bunshin_Clear(playerid)
         gBunshinSlots[playerid][c] = -1;
     }
     gBunshinExpireTick[playerid] = 0;
+    gBunshinToSpawn[playerid] = 0;
     return 1;
 }
 
@@ -713,6 +1060,20 @@ stock Bunshin_Effect_Destroy(objid)
     DestroyDynamicObject(objid);
     return 1;
 }
+
+// ===============================
+// BUNSHIN - CONFIG RÁPIDA
+// ===============================
+// 1 = mostra nametag acima da cabeça (SistemaBandanaIDStatus)
+// 0 = não mostra nametag (fica "limpo")
+#if !defined BUNSHIN_NAMETAG
+    #define BUNSHIN_NAMETAG (0)
+#endif
+
+// 1 = herda também clã e rank do dono (fica igualzinho no topo)
+#if !defined BUNSHIN_INHERIT_CLAN_RANK
+    #define BUNSHIN_INHERIT_CLAN_RANK (1)
+#endif
 
 forward Bunshin_DoSpawn(playerid);
 public Bunshin_DoSpawn(playerid)
@@ -723,7 +1084,19 @@ public Bunshin_DoSpawn(playerid)
     new interior = gBunshinSpawnInterior[playerid];
     new skin = gBunshinSpawnSkin[playerid];
 
-    for(new c=0; c<BUNSHIN_MAX_CLONES; c++)
+    // Bunshin herda a vila/bandana do dono (mesmo ID do SistemaBandanaIDStatus)
+    new vila = Info[playerid][pMember];
+
+    // Nome EXATO que aparece na sua nametag (usa Info[pNome]; se vazio, cai no nick do SA-MP)
+    new donoNome[MAX_PLAYER_NAME];
+    format(donoNome, sizeof donoNome, "%s", Info[playerid][pNome]);
+    if(donoNome[0] == '\0') GetPlayerName(playerid, donoNome, sizeof donoNome);
+
+    new spawnCount = gBunshinToSpawn[playerid];
+    if(spawnCount <= 0) return 1;
+    if(spawnCount > BUNSHIN_MAX_CLONES) spawnCount = BUNSHIN_MAX_CLONES;
+
+    for(new c=0; c<spawnCount; c++)
     {
         new Float:ox = gBunshinSpawnX[playerid][c];
         new Float:oy = gBunshinSpawnY[playerid][c];
@@ -737,15 +1110,44 @@ public Bunshin_DoSpawn(playerid)
             ox = px; oy = py; oz = pz;
         }
 
+        // Nome interno PRECISA ser único (não use nome do player aqui)
+        new cname[32];
+        format(cname, sizeof cname, "Bunshin_%d_%d", playerid, c);
+
         new slot = SHRP_NpcCreate(cname, skin, NPCT_GUARD, vila, ox, oy, oz, vw, interior);
         if(slot != -1)
         {
+            new npcid = SHRP_NpcGetId(slot);
+
             SHRP_NpcSetRewards(slot, 0, 0);
             SHRP_NpcSetHP(slot, 80.0);
             SHRP_NpcSetTaijutsu(slot, floatround(Info[playerid][pTaijutsu] * 0.70));
 
             // segue o dono e ataca inimigos perto dele
             SHRP_NpcSetOwner(slot, playerid, 2.0);
+
+            // ====== NOME + VILA iguais ao dono (pro seu SistemaBandanaIDStatus) ======
+            if(npcid != INVALID_PLAYER_ID)
+            {
+                format(Info[npcid][pNome], MAX_PLAYER_NAME, "%s", donoNome);
+                Info[npcid][pMember] = vila;
+
+                #if BUNSHIN_INHERIT_CLAN_RANK
+                    Info[npcid][pClan] = Info[playerid][pClan];
+                    NinjaFamaRank[npcid] = NinjaFamaRank[playerid];
+                #endif
+
+                // Toggle fácil da nametag do bunshin
+                #if defined SHRP_NpcSetTagEnabled
+                    SHRP_NpcSetTagEnabled(slot, (BUNSHIN_NAMETAG != 0));
+                #endif
+
+                #if BUNSHIN_NAMETAG
+                    // força atualizar o label depois de copiar nome/vila
+                    if(funcidx("SistemaBandanaIDStatus") != -1)
+                        CallLocalFunction("SistemaBandanaIDStatus", "i", npcid);
+                #endif
+            }
 
             gBunshinSlots[playerid][c] = slot;
         }
@@ -755,18 +1157,44 @@ public Bunshin_DoSpawn(playerid)
     return 1;
 }
 
+
 stock Jutsu_KageBunshin(playerid)
 {
     new now = GetTickCount();
     if(now < gBunshinNextUseTick[playerid])
         return SendClientMessage(playerid, -1, "(JUTSU) Aguarde o cooldown do Bunshin."), 1;
 
+    // Permissão do Bunshin: só usa se um ADMIN liberou (Painel Bunshin / /darclone)
+    if(!gBunshinGranted[playerid] || gBunshinGrantedMax[playerid] <= 0)
+        return SendClientMessage(playerid, -1, "(JUTSU) Você não possui permissão para usar Kage Bunshin."), 1;
+
+    // Regra de quantidade:
+    // - Genin/Chunin/etc: máximo 1 se a liberação do admin for 1 ou 2
+    // - Jounin: máximo 2 se a liberação do admin for 2
+    // - Acima de 2: somente admin pode liberar, então respeita o valor liberado
+    new allowed = gBunshinGrantedMax[playerid];
+    new spawnCount;
+
+    if(allowed <= 2)
+    {
+        if(Info[playerid][pRank] == 3) // Jounin
+            spawnCount = (allowed >= 2) ? 2 : 1;
+        else
+            spawnCount = 1;
+    }
+    else
+    {
+        spawnCount = allowed;
+        if(spawnCount > BUNSHIN_MAX_CLONES) spawnCount = BUNSHIN_MAX_CLONES;
+    }
     // chakra (usa seu core do GM)
     if(Info[playerid][pChakraEnUso] < BUNSHIN_CHAKRA_COST) return SemChakra(playerid);
     BaixarChakra(playerid, BUNSHIN_CHAKRA_COST);
 
     Bunshin_Clear(playerid);
 
+
+    gBunshinToSpawn[playerid] = spawnCount;
     new Float:x, Float:y, Float:z;
     GetPlayerPos(playerid, x, y, z);
 
@@ -784,7 +1212,7 @@ gBunshinSpawnInterior[playerid] = interior;
 gBunshinSpawnSkin[playerid] = skin;
 
 // calcula os pontos onde cada clone vai nascer e cria o FX primeiro nesses pontos
-for(new c=0; c<BUNSHIN_MAX_CLONES; c++)
+for(new c=0; c<gBunshinToSpawn[playerid]; c++)
 {
     // offsets fixos (mesmos usados no spawn)
     new Float:ox = x + (c == 0 ? 1.2 : c == 1 ? -1.2 : 0.0);
@@ -932,8 +1360,8 @@ stock MenuNpc_OnPlayerDisconnect(playerid)
         if(idx >= 0 && idx < MENUNPC_MAX_SPAWNS && gMnSpawn[idx][mnUsed] && gMnSpawn[idx][mnPendingSkin])
         {
             #if defined _ECO_CORE_INCLUDED
-            if(gMnPendingSkinIsGuard[playerid] && gMnSpawn[idx][mnCost] > 0 && gMnSpawn[idx][mnVila] > 0)
-                gEcoTreasury[gMnSpawn[idx][mnVila]] += gMnSpawn[idx][mnCost];
+            if(gMnPendingSkinIsGuard[playerid] && gMnSpawn[idx][mnCost] > 0 && gMnSpawn[idx][mnEcoVila] > 0)
+                gEcoTreasury[gMnSpawn[idx][mnEcoVila]] += gMnSpawn[idx][mnCost];
             #endif
 
             Mn_ResetSpawn(idx);
