@@ -20,10 +20,18 @@ public VerificarSelos(playerid, const selos[])
     if (!IsPlayerConnected(playerid)) return 0;
     if (!strlen(selos)) return 0;
 
-    // (Opcional) debug:
-    // printf("[SELOS] player %d: %s", playerid, selos);
+    // EXEMPLO de sequência canônica: "Tigre, Cobra, Tigre, "
+    // (HBCH_SelosCanonicalize padroniza)
+    new canon[128];
+    if (HBCH_SelosCanonicalize(selos, canon, sizeof canon))
+    {
+        if (!strcmp(canon, "Tigre, Cobra, Tigre, ", true))
+            return Jutsu_KageBunshin(playerid);
+    }
 
     return Jutsu_CastBySelos(playerid, selos);
 }
+
+
 
 #endif // _SHRP_SELOS_INCLUDED

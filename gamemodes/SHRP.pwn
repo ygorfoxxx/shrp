@@ -4502,7 +4502,8 @@ new Info[MAX_PLAYERS+1][pInfo];
 //#include "Includes\Academia\academia.pwn"
 #include "Includes\Perfil\limiteatributos.pwn"
 #include "Includes\Npcs\bandidos.pwn"
-#include "Includes\Npcs\shinobi_system_v1.pwn"
+#include "Includes\Npcs\shinobi_ai.pwn"
+#include "Includes\Npcs\menunpc.pwn"
 // === Registro de Personagem (fluxo: sexo -> nome -> vila -> elemento -> cl?)
 #include "Includes\Core\registro.pwn"
 
@@ -14091,7 +14092,9 @@ function ConvertAccount(playerid)
 public OnPlayerDisconnect(playerid, reason)
 {
 
-    ShinobiSys_OnPlayerDeath(playerid, killerid, reason);
+
+    MenuNpc_OnPlayerDisconnect(playerid);
+
 
     if(IsPlayerNPC(playerid))
     {
@@ -17510,7 +17513,8 @@ function SetPlayerToTeamColor(playerid) // Colores.
 public OnGameModeExit()
 {
 
-    ShinobiSys_OnGameModeExit();
+    MenuNpc_Shutdown();
+	SHRP_NpcAI_Shutdown();
 
     //Bandido_SystemExit();
     EcoCore_OnGameModeExit();
@@ -19181,7 +19185,8 @@ forward Speedometer(playerid); // Nuevo.
 public OnGameModeInit()
 {
 
-    ShinobiSys_OnGameModeInit();
+    SHRP_NpcAI_Init();
+	MenuNpc_Init();
     Bandido_Init();
     EcoCore_OnGameModeInit();
     CreateDynamicObject(12014, 1248.7744, -1278.8015, 1677.3565, 0, 0, 0);
@@ -22920,7 +22925,10 @@ public OnPlayerEditAttachedObject( playerid, response, index, modelid, boneid,Fl
 public OnDialogResponse(playerid, dialogid, response, listitem, inputtext[])
 {
 
-    if(ShinobiSys_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
+    if (MenuNpc_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
+	if (BandidoMenu_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
+
+
     if(EcoShops_OnDialogResponse(playerid, dialogid, response, listitem, inputtext)) return 1;
     if(BandidoMenu_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
     if(AcademiaTreinos_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
@@ -22946,43 +22954,7 @@ public OnDialogResponse(playerid, dialogid, response, listitem, inputtext[])
             return 1;
         }
     }
-    /*if (dialogid == 10010){
-        if(response){
-            new jogadoresOnline[10];
-        new count = 0;
-        new slot;
 
-        // Reconstruir array de slots online (mesma l?gica do RaijinVoadorGo)
-        for(slot = 0; slot < 10; slot++)
-        {
-            if(strcmp(MarcasHiraishin[playerid][pNome][slot], "0", true) != 0) // slot n?o vazio
-            {
-                new targetId = GetPlayerIdByName(MarcasHiraishin[playerid][pNome][slot]);
-                if(targetId != INVALID_PLAYER_ID)
-                {
-                    jogadoresOnline[count] = slot; // salvar ?ndice do slot
-                    count++;
-                }
-            }
-        }
-
-
-        if(listitem >= 0 && listitem < count)
-        {
-            new Position[3];
-            slot = jogadoresOnline[listitem]; // pega o slot escolhido
-            Raijin[playerid][raijinTarget] = GetPlayerIdByName(MarcasHiraishin[playerid][pNome][slot]);
-            GetPlayerPos(playerid, Position[0], Position[1], Position[2]);
-            Raijin[playerid][raijinTimer] = gettime() + RAIJIN_COOLDOWN;
-            Raijin[playerid][raijinUsed] = 0;
-            SetPlayerInFrontOfPlayer(playerid, Raijin[playerid][raijinTarget]); // Poem o jogador na frente do alvo.
-            AudioInPlayer(playerid, 35.0, 126);
-            Raijin[playerid][raijinObj][0] = CreateDynamicObject(18710, Position[0], Position[1], Position[2], 0.0, 0.0, 0.0, vw);
-            SetTimerEx("RaijinAlvoObj", 100, false, "i", playerid);
-            HirashinSay(playerid);
-        }
-        }
-    }*/
     // === Sistema de Guildas === //
     // === Ferreiro
     if(dialogid == DIALOG_ENTRADAFERREIRO)
@@ -45360,10 +45332,11 @@ function ClearJutsu(playerid)
     return 1;
 }
 
+
 // Mantm a assinatura antiga para no quebrar nada do servidor
 stock IsPlayerHittable(playerid)
 {
-     return IsPlayerHittableEx(playerid, SHRP_NpcAI_IsCombatNPC(playerid));
+    return IsPlayerHittableEx(playerid, false); // por padro: NO permite NPC
 }
 
 // Nova verso com flag pra permitir NPC quando necessrio
