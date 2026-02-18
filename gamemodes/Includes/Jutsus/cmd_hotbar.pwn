@@ -78,7 +78,14 @@ static const gJutsuNome[][] =
     "Modo: Dragao (Minato)",
     "Raijin: Voador",
 
-    "Cla: Tigre (varia por cla)"
+	"Invocação: Prisão do Sapo", //jutsu invocacao sapo
+	
+    "Cla: Tigre (varia por cla)",
+	
+	"Hyuuga: Byakugan",
+	"Hyuuga: Hakkeshou Kaiten"
+
+
 };
 
 stock bool:Jutsu_IsValidId(jutsuId)

@@ -42,12 +42,6 @@
     #define HTTP_PUT (4)
 #endif
 
-// declara apenas uma vez (usa macro guarda)
-#if !defined _SHRP_HTTP_NATIVE_DECL
-    #define _SHRP_HTTP_NATIVE_DECL
-    native HTTP(index, type, const url[], const data[], const callback[]);
-#endif
-
 #include <FCNPC>
 
 // Tipos do shinobi_ai (fallback, caso nao tenha incluido ainda)

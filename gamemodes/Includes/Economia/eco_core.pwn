@@ -39,7 +39,7 @@ new bool:gEcoAlliance[ECO_MAX_VILAS][ECO_MAX_VILAS];
 new gEcoReqAllyFrom[ECO_MAX_VILAS];
 new gEcoReqPeaceFrom[ECO_MAX_VILAS];
 
-// ======= Caps por vila (vira “cap por categoria” quando categoria = vila dona)
+// ======= Caps por vila (vira cap por categoria quando categoria = vila dona)
 // Ajuste aqui os caps base:
 // - Comida = Kiri: paz menor, guerra baixa
 // - Armas = Iwa: paz maior, guerra maior
@@ -88,6 +88,26 @@ stock Eco_IsValidVila(v)
     return (v > 0 && v < ECO_MAX_VILAS);
 }
 
+
+
+// ============================================================
+// Tesouro da vila (Economia)
+// - Profissoes e outros sistemas podem depositar aqui.
+// - Valores sao salvos/carregados junto do eco_core.
+// ============================================================
+stock Eco_AddTreasury(vila, amount)
+{
+    if(amount <= 0) return 0;
+    if(!Eco_IsValidVila(vila)) return 0;
+    gEcoTreasury[vila] += amount;
+    return 1;
+}
+
+stock Eco_GetTreasury(vila)
+{
+    if(!Eco_IsValidVila(vila)) return 0;
+    return gEcoTreasury[vila];
+}
 stock Eco_GetVilaName(vila, name[], size)
 {
     switch(vila)
@@ -361,7 +381,7 @@ stock Eco_PrintTax(playerid, ownerVila, basePrice, taxPaid, pct, totalPaid)
     Eco_GetVilaName(ownerVila, vName, sizeof vName);
 
     // Chat "de player": mostra quanto saiu de imposto e a %.
-    // Importante: NÃO mostra o quanto a vila tem no tesouro (isso fica só nos comandos do Kage).
+    // Importante: NO mostra o quanto a vila tem no tesouro (isso fica s nos comandos do Kage).
     new msg[160];
     format(msg, sizeof msg,
         "{B9FFB9}[ECONOMIA]{FFFFFF} Loja de {A2D7FF}%s{FFFFFF} | Base: {FFFF99}%d{FFFFFF} | Imposto: {FFCC66}%d{FFFFFF} ({FFCC66}%d%%{FFFFFF}) | Total: {FFFF99}%d",

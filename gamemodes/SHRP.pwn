@@ -50,6 +50,237 @@
 #include <CustomSkins>
 #include <FCNPC>
 
+// =====================================================================
+// SHRP - Launcher Auth (Token -> Nick real -> Auto-login/Auto-register)
+// Objetivo:
+//  - Launcher abre o SA-MP com Nick "TK<token>"
+//  - Gamemode consome token no backend e troca o nick pro real
+//  - Depois disso: entra automaticamente (sem pedir senha)
+// =====================================================================
+
+// tenta incluir a_http se existir (evita "undefined symbol HTTP")
+#if !defined _a_http_included
+    #tryinclude <a_http>
+#endif
+
+// -------------------- Config --------------------
+#if !defined LAUNCHER_REQUIRE_TOKEN
+    #define LAUNCHER_REQUIRE_TOKEN    (1) // 1 = s entra via Launcher
+#endif
+
+#if !defined LAUNCHER_AUTOLOGIN
+    #define LAUNCHER_AUTOLOGIN        (1) // 1 = no pede senha (auto-login / auto-register)
+#endif
+
+#define LAUNCHER_BACKEND_URL "127.0.0.1:3000" // backend na MESMA mquina do servidor SA-MP
+#define LAUNCHER_GAME_SECRET          "p1rul1t0" // tem que bater com GAME_SECRET no .env do backend
+
+#define LAUNCHER_TOKEN_PREFIX0        ('T')
+#define LAUNCHER_TOKEN_PREFIX1        ('K')
+
+#define LAUNCHER_TOKEN_MINLEN         (10)
+#define LAUNCHER_TOKEN_MAXLEN         (20) // pra caber no nick do SA-MP (max 24)
+
+#define LAUNCHER_DEBUG                (1)
+
+// -------------------- HTTP fallback --------------------
+// Se a_http no existir, mas o servidor suportar HTTP nativo, isso compila.
+#if !defined _a_http_included
+    #if !defined HTTP_GET
+        #define HTTP_GET (1)
+    #endif
+    native HTTP(index, type, const url[], const data[], const callback[]);
+#endif
+
+// -------------------- Estado --------------------
+enum eLauncherAuthState
+{
+    LAUTH_NONE = 0,
+    LAUTH_PENDING,
+    LAUTH_OK,
+    LAUTH_FAIL
+};
+
+new gLauncherAuthState[MAX_PLAYERS];
+new gLauncherAutoLoginDone[MAX_PLAYERS];
+new gLauncherToken[MAX_PLAYERS][LAUNCHER_TOKEN_MAXLEN + 1];
+new gLauncherRealNick[MAX_PLAYERS][MAX_PLAYER_NAME];
+new gLauncherDiscordId[MAX_PLAYERS][32];
+
+// -------------------- Helpers --------------------
+stock LauncherAuth_Debug(const msg[])
+{
+    #if LAUNCHER_DEBUG
+        print(msg);
+    #endif
+    return 1;
+}
+
+stock LauncherAuth_Reset(playerid)
+{
+    gLauncherAuthState[playerid] = LAUTH_NONE;
+    gLauncherAutoLoginDone[playerid] = 0;
+    gLauncherToken[playerid][0] = '\0';
+    gLauncherRealNick[playerid][0] = '\0';
+    gLauncherDiscordId[playerid][0] = '\0';
+    return 1;
+}
+
+forward LauncherAuth_KickDelayed(playerid);
+public LauncherAuth_KickDelayed(playerid)
+{
+    if (IsPlayerConnected(playerid)) Kick(playerid);
+    return 1;
+}
+
+stock LauncherAuth_IsTokenNick(const name[])
+{
+    return (name[0] == LAUNCHER_TOKEN_PREFIX0 && name[1] == LAUNCHER_TOKEN_PREFIX1);
+}
+
+stock LauncherAuth_ExtractToken(const name[], token[], size)
+{
+    // espera "TK<token>"
+    if (!LauncherAuth_IsTokenNick(name)) return 0;
+
+    new len = strlen(name);
+    if (len <= 2) return 0;
+
+    new tlen = len - 2;
+    if (tlen < LAUNCHER_TOKEN_MINLEN || tlen > LAUNCHER_TOKEN_MAXLEN) return 0;
+
+    // copia s o token (sem "TK")
+    strmid(token, name, 2, len, size);
+    return 1;
+}
+
+// JSON simples (sem parser): pega string do tipo "key":"value"
+stock JsonGetStringSimple(const src[], const key[], dest[], size)
+{
+    dest[0] = '\0';
+
+    new pattern[80];
+    format(pattern, sizeof(pattern), "\"%s\":\"", key);
+
+    new p = strfind(src, pattern, true);
+    if (p == -1) return 0;
+    p += strlen(pattern);
+
+    // acha a prxima aspas dupla a partir de p
+    new end = strfind(src, "\"", true, p);
+    if (end == -1) return 0;
+
+    // copia [p .. end)
+    strmid(dest, src, p, end, size);
+    return 1;
+}
+
+// -------------------- Fluxo --------------------
+stock LauncherAuth_Begin(playerid)
+{
+    LauncherAuth_Reset(playerid);
+
+    new name[MAX_PLAYER_NAME];
+    GetPlayerName(playerid, name, sizeof(name));
+
+    if (LauncherAuth_ExtractToken(name, gLauncherToken[playerid], sizeof(gLauncherToken[])))
+    {
+        gLauncherAuthState[playerid] = LAUTH_PENDING;
+
+        new ip[16];
+        GetPlayerIp(playerid, ip, sizeof(ip));
+
+        new url[256];
+		format(url, sizeof(url), "%s/api/game/consume?token=%s&ip=%s&key=%s",
+		    LAUNCHER_BACKEND_URL, gLauncherToken[playerid], ip, LAUNCHER_GAME_SECRET);
+		HTTP(playerid, HTTP_GET, url, "", "LauncherAuth_OnConsume");
+
+        return 1;
+    }
+
+    // Sem token
+    #if LAUNCHER_REQUIRE_TOKEN
+        SendClientMessage(playerid, 0xFF4444FF, "Este servidor exige Launcher. Abra o jogo pelo Launcher e tente novamente.");
+        gLauncherAuthState[playerid] = LAUTH_FAIL;
+        Kick(playerid);
+        return 1;
+    #endif
+
+    return 0;
+}
+
+public LauncherAuth_OnConsume(index, response_code, data[])
+{
+    new playerid = index;
+    if (!IsPlayerConnected(playerid)) return 1;
+
+    if (gLauncherAuthState[playerid] != LAUTH_PENDING) return 1;
+
+    if (response_code != 200 || strlen(data) < 8)
+    {
+        new reason[64];
+        if (!JsonGetStringSimple(data, "reason", reason, sizeof(reason)))
+            format(reason, sizeof(reason), "HTTP_%d", response_code);
+
+        new msg[160];
+        format(msg, sizeof(msg), "Falha ao validar o Launcher (%s).", reason);
+        SendClientMessage(playerid, 0xFF4444FF, msg);
+
+        #if LAUNCHER_DEBUG
+            new dbg[220];
+            format(dbg, sizeof(dbg), "[LAUNCHER] consume falhou (code=%d): %s", response_code, data);
+            print(dbg);
+        #endif
+
+        gLauncherAuthState[playerid] = LAUTH_FAIL;
+        SetTimerEx("LauncherAuth_KickDelayed", 1500, false, "i", playerid);
+        return 1;
+    }
+
+    // ok true?
+    if (strfind(data, "\"ok\":true", true) == -1)
+    {
+        new reason[32];
+        if (!JsonGetStringSimple(data, "reason", reason, sizeof(reason))) format(reason, sizeof(reason), "AUTH_FAIL");
+
+        new msg[144];
+        format(msg, sizeof(msg), "Falha ao validar o Launcher (%s).", reason);
+        SendClientMessage(playerid, 0xFF4444FF, msg);
+
+        gLauncherAuthState[playerid] = LAUTH_FAIL;
+        Kick(playerid);
+        return 1;
+    }
+
+    if (!JsonGetStringSimple(data, "nick", gLauncherRealNick[playerid], sizeof(gLauncherRealNick[])))
+    {
+        SendClientMessage(playerid, 0xFF4444FF, "Falha ao validar o Launcher (sem nick).");
+        gLauncherAuthState[playerid] = LAUTH_FAIL;
+        Kick(playerid);
+        return 1;
+    }
+
+    JsonGetStringSimple(data, "discordId", gLauncherDiscordId[playerid], sizeof(gLauncherDiscordId[]));
+
+    // Troca o nick do player pro nick real (scoreboard/chat + INI)
+    if (!SetPlayerName(playerid, gLauncherRealNick[playerid]))
+    {
+        SendClientMessage(playerid, 0xFF4444FF, "Seu nick j est em uso no servidor. Feche o jogo e tente novamente.");
+        gLauncherAuthState[playerid] = LAUTH_FAIL;
+        Kick(playerid);
+        return 1;
+    }
+
+    // (opcional) se teu GM usa algum PVar de nome guardado
+    SetPVarString(playerid, "GuardadoName", gLauncherRealNick[playerid]);
+
+    gLauncherAuthState[playerid] = LAUTH_OK;
+    LauncherAuth_Debug("[LAUNCHER] token OK, nick trocado.");
+
+    return 1;
+}
+
+
 
 // Defini??es de movimento caso n?o existam na sua include
 #if !defined FCNPC_MOVE_TYPE_AUTO
@@ -898,6 +1129,14 @@ enum dataKagenui
     kagenuiHitted,
     kagenuiObj
 }
+
+//arma
+
+new UsandoArma[MAX_PLAYERS];
+new AnimArma[MAX_PLAYERS];
+new ArmaLendaria[MAX_PLAYERS];
+new BuffArmaLendaria[MAX_PLAYERS];
+
 new Kagenui[MAX_PLAYERS][dataKagenui];
 //=== Combate ===//
 new LimiteDash[MAX_PLAYERS];
@@ -953,6 +1192,203 @@ enum defesaComboData
     defesaTimer
 }
 new DefesaH[MAX_PLAYERS][defesaComboData];
+// ==========================================================
+// Quebra-Combo (DEFENSA) - SHRP
+// - Situao 1: defender o Rapid Dash no timing -> cancela hit e pode contra-atacar
+// - Situao 2: aps 3 hits tomados em sequncia -> libera DEFENSA para quebrar combo (empurro pequeno)
+// Cooldown compartilhado (PVar "QC_CD") = 40s
+// ==========================================================
+#define QUEBRACOMBO_COOLDOWN 40
+#define QUEBRACOMBO_REQUIRED_HITS 3
+#define QUEBRACOMBO_CHAIN_MS 1600
+#define QUEBRACOMBO_MAX_DIST 3.2
+
+// ==========================================================
+// CONFIG (AJUSTE AQUI) - Quebra-Combo / Defesa do Rapid Dash
+//
+// QUEBRACOMBO_PUSH_SPEED:
+//   Fora horizontal do empurro ( "velocity", ento quanto maior, mais distncia o inimigo recua).
+//   0.15 = bem curto | 0.20 = padro | 0.28+ = comea a ficar perceptvel/longo.
+//
+// QUEBRACOMBO_PUSH_Z:
+//   Um pequeno Z s pra "descolar" do cho e dar sensao de empurro.
+//   Mantenha baixo (0.03 ~ 0.08).
+// ==========================================================
+#define QUEBRACOMBO_PUSH_SPEED 0.20
+#define QUEBRACOMBO_PUSH_Z 0.05
+
+new QC_HitCount[MAX_PLAYERS];
+new QC_LastAttacker[MAX_PLAYERS];
+new QC_LastHitTick[MAX_PLAYERS];
+new bool:QC_Ready[MAX_PLAYERS];
+
+stock QC_InitPlayer(playerid)
+{
+    QC_HitCount[playerid] = 0;
+    QC_LastAttacker[playerid] = INVALID_PLAYER_ID;
+    QC_LastHitTick[playerid] = 0;
+    QC_Ready[playerid] = false;
+    DeletePVar(playerid, "QC_CD"); // timestamp em segundos (gettime) de quando pode usar de novo
+    return 1;
+}
+
+stock bool:QC_CooldownReady(playerid)
+{
+    new t = GetPVarInt(playerid, "QC_CD");
+    return (t <= 0 || t <= gettime());
+}
+
+stock QC_StartCooldown(playerid)
+{
+    SetPVarInt(playerid, "QC_CD", gettime() + QUEBRACOMBO_COOLDOWN);
+    return 1;
+}
+
+stock QC_ClearHitLock(playerid)
+{
+    // remove o "lock" de hitted (520ms) para permitir reao imediata (dash/jutsu/contra-ataque)
+    if(TaijutsuVar[playerid][taiHitted])
+    {
+        KillTimer(TaijutsuVar[playerid][taiHitted]);
+        TaijutsuVar[playerid][taiHitted] = 0;
+    }
+    return 1;
+}
+
+// Retorna TRUE se o player est "em combo" (tomando hits em sequncia).
+// Usado para bloquear pulo/aes especficas durante o stun do combo.
+stock bool:QC_IsChainActive(playerid)
+{
+    if(QC_HitCount[playerid] <= 0) return false;
+    return ((GetTickCount() - QC_LastHitTick[playerid]) <= QUEBRACOMBO_CHAIN_MS);
+}
+
+// Chame isso em jutsus de ESCAPE (ex: Sharingan/Kawarimi/Izanagi)
+// para "quebrar" o combo e liberar aes imediatamente.
+// (no consome cooldown do Quebra-Combo,  s limpeza de estado)
+stock QC_ResetChain(playerid)
+{
+    QC_HitCount[playerid] = 0;
+    QC_LastAttacker[playerid] = INVALID_PLAYER_ID;
+    QC_LastHitTick[playerid] = 0;
+    QC_Ready[playerid] = false;
+    return 1;
+}
+
+
+stock QC_SmallPush(attackerid, defenderid)
+{
+    // Empurro PEQUENO (no  chute/knockback longo)
+    new Float:ax, Float:ay, Float:az;
+    new Float:dx, Float:dy, Float:dz;
+    GetPlayerPos(attackerid, ax, ay, az);
+    GetPlayerPos(defenderid, dx, dy, dz);
+
+    new Float:vx = (ax - dx);
+    new Float:vy = (ay - dy);
+
+    new Float:len = floatsqroot(vx*vx + vy*vy);
+    if(len < 0.001) len = 0.001;
+
+    vx = (vx / len) * QUEBRACOMBO_PUSH_SPEED; // ajuste em QUEBRACOMBO_PUSH_SPEED
+    vy = (vy / len) * QUEBRACOMBO_PUSH_SPEED;
+
+    // Z bem baixo s pra "descolar" do cho e dar sensao de empurro.
+    // Ajuste em QUEBRACOMBO_PUSH_Z
+    SetPlayerVelocity(attackerid, vx, vy, QUEBRACOMBO_PUSH_Z);
+    return 1;
+}
+
+stock QC_RegisterHit(attackerid, victimid)
+{
+    // s conta hits "reais" (sem DEFENSA) para armar o quebra-combo
+    new now = GetTickCount();
+
+    if(QC_LastAttacker[victimid] != attackerid || (now - QC_LastHitTick[victimid]) > QUEBRACOMBO_CHAIN_MS)
+    {
+        QC_HitCount[victimid] = 0;
+        QC_Ready[victimid] = false;
+        QC_LastAttacker[victimid] = attackerid;
+    }
+
+    QC_LastHitTick[victimid] = now;
+
+    // se ainda est em cooldown, no arma (mantm o combate mais justo)
+    if(!QC_CooldownReady(victimid)) return 1;
+
+    if(QC_HitCount[victimid] < QUEBRACOMBO_REQUIRED_HITS)
+        QC_HitCount[victimid]++;
+
+    if(QC_HitCount[victimid] >= QUEBRACOMBO_REQUIRED_HITS)
+        QC_Ready[victimid] = true;
+
+    return 1;
+}
+
+stock bool:QC_CanTriggerNow(playerid, &attackerid)
+{
+    if(!QC_Ready[playerid]) return false;
+    if(!QC_CooldownReady(playerid)) return false;
+
+    // precisa estar realmente em sequncia de hits (janela curta)
+    if((GetTickCount() - QC_LastHitTick[playerid]) > QUEBRACOMBO_CHAIN_MS) return false;
+
+    attackerid = QC_LastAttacker[playerid];
+    if(attackerid == INVALID_PLAYER_ID) return false;
+    if(!IsPlayerConnected(attackerid)) return false;
+    if(GetPlayerVirtualWorld(attackerid) != GetPlayerVirtualWorld(playerid)) return false;
+
+    new Float:px, Float:py, Float:pz;
+    new Float:ax, Float:ay, Float:az;
+    GetPlayerPos(playerid, px, py, pz);
+    GetPlayerPos(attackerid, ax, ay, az);
+
+    new Float:dx = ax - px;
+    new Float:dy = ay - py;
+    new Float:dist = floatsqroot(dx*dx + dy*dy);
+
+    if(dist > QUEBRACOMBO_MAX_DIST) return false;
+
+    return true;
+}
+
+stock bool:QC_TryTrigger(playerid)
+{
+    new attackerid;
+    if(!QC_CanTriggerNow(playerid, attackerid)) return false;
+
+    // ativa DEFENSA (postura) + quebra-combo (empurro pequeno)
+    SetPlayerFacingAngleToCamera(playerid);
+    AudioInPlayer(playerid, 20.0, 87);
+
+    SetPVarInt(playerid, "Defensa", 1);
+    // reseta contadores da defesa para evitar quebrar imediatamente por estado antigo
+    DefesaH[playerid][defesaHit] = 0;
+    DefesaH[playerid][defesaHitDash] = 0;
+    ClearSelo(playerid);
+    _CCDefesa(playerid);
+
+    // efeito principal: empurro pequeno no agressor + liberar reao do defensor
+    QC_SmallPush(attackerid, playerid);
+    QC_ClearHitLock(playerid);
+
+    // consome o quebra-combo
+    QC_StartCooldown(playerid);
+    QC_Ready[playerid] = false;
+    QC_HitCount[playerid] = 0;
+
+    // feedback de som (mesmo do "bateu na defesa")
+    AudioInPlayer(playerid, 30.0, 108);
+
+    // animao de defesa (mesma do sistema)
+    if(AnimArma[playerid] == 1 || AnimArma[playerid] == 5)
+        ApplyAnimation(playerid, "Arma_1", "Gunbai_Parado", 4.0, 0, 1, 1, 1, 0, 1);
+    else
+        ApplyAnimation(playerid, "ped", "KART_R", 4.0, 0, 1, 1, 1, 0, 1);
+
+    return true;
+}
+
 //Obj Combate
 new ObjetoEffect[MAX_PLAYERS];
 //Obj Combate Final
@@ -2662,10 +3098,7 @@ enum dataKageChapeu
     Float:kc_sz
 }
 new KageChapeu[MAX_PLAYERS][MAX_PLAYER_ATTACHED_OBJECTS][dataKageChapeu];
-new UsandoArma[MAX_PLAYERS];
-new AnimArma[MAX_PLAYERS];
-new ArmaLendaria[MAX_PLAYERS];
-new BuffArmaLendaria[MAX_PLAYERS];
+
 #define             PASTA_ARMAPOS               "CONTAS/INVENTARIO/ACESSORIOS/ARMAPOS/%s.ini"
 #define             PASTA_ARMAPOS2               "CONTAS/INVENTARIO/ACESSORIOS/ARMAPOS/2%s.ini"
 enum dataArmaAce
@@ -4410,6 +4843,7 @@ enum pInfo
     pBandana,
     pProgressoHP,
     pProgressoDP,
+    pClanNivel, // NOVO: nivel do cla (0..2)
     pKaton, // KATON
     pFuton, // FUTON
     pRaiton, // RAITON
@@ -4499,6 +4933,30 @@ enum pInfo
     pGuilda,
 };
 new Info[MAX_PLAYERS+1][pInfo];
+
+#define CLAN_HYUUGA      (4)
+#define CLANLVL_MAX      (2)
+
+stock Clan_ClampLevel(lvl)
+{
+    if(lvl < 0) return 0;
+    if(lvl > CLANLVL_MAX) return CLANLVL_MAX;
+    return lvl;
+}
+
+stock Clan_EnsureDefaults(playerid)
+{
+    Info[playerid][pClanNivel] = Clan_ClampLevel(Info[playerid][pClanNivel]);
+
+    // Hyuuga sempre nasce no nivel 1 (Byakugan)
+    if(Info[playerid][pClan] == CLAN_HYUUGA && Info[playerid][pClanNivel] < 1)
+        Info[playerid][pClanNivel] = 1;
+
+    return 1;
+}
+
+
+
 //#include "Includes\Academia\academia.pwn"
 #include "Includes\Perfil\limiteatributos.pwn"
 #include "Includes\Npcs\bandidos.pwn"
@@ -5949,6 +6407,7 @@ function LoadUser_data(playerid,name[],value[])
     INI_Int("Crates",Info[playerid][pCrates]);
     INI_Int("Adic",Info[playerid][pAdiccion]);
     INI_Int("Clan",Info[playerid][pClan]);
+    INI_Int("ClanNivel",Info[playerid][pClanNivel]);
     INI_Int("LiderReligioso",Info[playerid][pClanLider]);
     INI_Int("Leader",Info[playerid][pLeader]);
     INI_Int("Member",Info[playerid][pMember]);
@@ -6553,7 +7012,7 @@ function GetColorCode(clr[]) {
 public OnPlayerKeyStateChange(playerid, newkeys, oldkeys)
 {
 
-
+    Daily_OnKey(playerid, newkeys, oldkeys);
     Iryou_OnKeyStateChange(playerid, newkeys, oldkeys);
     //Combate
     DireitoClicado(playerid, newkeys, oldkeys);
@@ -6986,492 +7445,7 @@ public OnPlayerKeyStateChange(playerid, newkeys, oldkeys)
         //
     }
 
-    /*if(HOLDING(KEY_HANDBRAKE))
-    {
-        new str[64];
-        if(IryouUse[playerid] == 1){PararDeCurar(playerid); return 1;}
-        if(ChuteForteAtivou[playerid] == 1 || PlayerRaijinVoador[playerid][raijinUsado] == 1 || PlayerRaijinVoador[playerid][raijinAtingido] == 1) return 0;
-        if(Info[playerid][pNinjaFraturado] == 1){TimerDanoFraturaJutsu[playerid] = SetTimerEx("FraturadoBraco", 200, false, "d", playerid);}
-        if(Meditando[playerid] == 1 || Info[playerid][pNinjaQuebrado] == 1 || Info[playerid][pNinjaQuebrado] == 2 || Info[playerid][pNinjaQuebrado] == 3) return 0;
-        if(DashFHitted[playerid] || Pescando[playerid] == 1 || Amarrado[playerid] == 1 || RasenganAt[playerid] == 1) return 0;
-        if(DaikodanHitAlvo[playerid] == 1 || Info[playerid][pDentroDeCasa] == 1 || KawarimiUsado[playerid] == 1 || HakkeshouON[playerid] == 1 || lastHitted[playerid][hitReason] > 1 || ChuteCimaHitImpossible[playerid] == 1 || DashUsado[playerid] == 1 || lastJutsu[playerid][jutsuLast] >= 1 || Info[playerid][pPrisaoBase] == 1) return 0;
-        if(GetPVarInt(playerid, "Inconsciente") >= 1 || KagutsuchiON[playerid] == 1 || IkazuchiHitAlvo[playerid] == 1 || UsandoKit[playerid] == 1 || EstaRoubando[playerid] == 1 || HittedDoroji[playerid] == 1 || HittedKageshibari[playerid] == 1 || Spectating[playerid] == 1 || CarregandoChakra[playerid] == 1 || SeladoS[playerid] == 1 || PlayerParalisado[playerid] == 1 ||
-           SetPlayerState[playerid] == 1 || ChuteCimaHitted[playerid] == 1 || Dormido[playerid] == 1 || DormindoNoColchonete[playerid] == 1 || SuirouHIT[playerid] == 1 || TsutenHittedAlvo[playerid] == 1 || KatonHIT[playerid] == 1) return 0;
-        BtnDireito[playerid] = 1;
-        if(PRESSED(newkeys, KEY_JUMP)) // Selo Tigre
-        {
-            if(Selos[playerid] == 2873)
-            {
-                Selos[playerid] += 8520*3;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 1450)
-            {
-                Selos[playerid] += 800*3;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 2540)
-            {
-                Selos[playerid] += 1250*3;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 1125)
-            {
-                Selos[playerid] += 200*3;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 65)
-            {
-                Selos[playerid] += 527*4;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 150)
-            {
-                Selos[playerid] += 120*8;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 50)
-            {
-                Selos[playerid] += 120*2;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 99)
-            {
-                Selos[playerid] += 520*2;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 800)
-            {
-                AudioInPlayer(playerid, 10.0, 71);
-                Selos[playerid] += 586*2;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                ApplyAnimation(playerid,"selos","tigre",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 250)
-            {
-                AudioInPlayer(playerid, 10.0, 71);
-                Selos[playerid] += 30*5;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                ApplyAnimation(playerid,"selos","tigre",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 849)
-            {
-                AudioInPlayer(playerid, 10.0, 71);
-                Selos[playerid] -= 35*2;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                ApplyAnimation(playerid,"selos","tigre",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 625)
-            {
-                AudioInPlayer(playerid, 10.0, 71);
-                Selos[playerid] += 25*25;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                ApplyAnimation(playerid,"selos","tigre",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 560)
-            {
-                AudioInPlayer(playerid, 10.0, 71);
-                Selos[playerid] += 45;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                ApplyAnimation(playerid,"selos","tigre",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 100)
-            {
-                Selos[playerid] += 9999;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","tigre",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else{
-                AudioInPlayer(playerid, 10.0, 71);
-                Selos[playerid] += 100;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                ApplyAnimation(playerid,"selos","tigre",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Tigre!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
 
-        }
-        if(PRESSED(newkeys, KEY_CTRL_BACK)) // Selo Rato
-        {
-            if(Selos[playerid] == 1139)
-            {
-                Selos[playerid] += 100*15;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Rato!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 365)
-            {
-                Selos[playerid] += 25*87;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Rato!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 400)
-            {
-                Selos[playerid] += 25*7;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Rato!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 625)
-            {
-                Selos[playerid] += 100*5;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Rato!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 605)
-            {
-                Selos[playerid] += 22*5;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Rato!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 290)
-            {
-                Selos[playerid] += 247*6;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Rato!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 100)
-            {
-                Selos[playerid] += 92*5;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Rato!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 50)
-            {
-                Selos[playerid] += 9999;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Rato!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else{
-                Selos[playerid] += 50;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","rato",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Rato!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-
-        }
-        if(PRESSED(newkeys, KEY_NO)) // Selo Cobra
-        {
-            if(Selos[playerid] == 28433)
-            {
-                Selos[playerid] += 325*5;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","cobra",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Cobra!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 3850)
-            {
-                Selos[playerid] += 325*5;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","cobra",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Cobra!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 1250)
-            {
-                Selos[playerid] += 325*5;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","cobra",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Cobra!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 2173)
-            {
-                Selos[playerid] += 350*2;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","cobra",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Cobra!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 100)
-            {
-                Selos[playerid] += 350*2;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","cobra",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Cobra!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 65)
-            {
-                Selos[playerid] += 9999;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","cobra",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Cobra!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }else{
-                Selos[playerid] += 65;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","cobra",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Cobra!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-
-        }
-        if(PRESSED(newkeys, KEY_CROUCH)) // Selo Dragao
-        {
-            if(Selos[playerid] == 2173)
-            {
-                Selos[playerid] += 250*2;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","dragao",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Dragao!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 1972)
-            {
-                Selos[playerid] += 159*2;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","dragao",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Dragao!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 1250)
-            {
-                Selos[playerid] += 546*2;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","dragao",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Dragao!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 290)
-            {
-                Selos[playerid] += 35*35;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","dragao",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Dragao!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 100)
-            {
-                Selos[playerid] += 35*15;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","dragao",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Dragao!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 99)
-            {
-                Selos[playerid] += 9999;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","dragao",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Dragao!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }else{
-                Selos[playerid] += 99;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","dragao",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Dragao!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-        }
-        if(PRESSED(newkeys, KEY_YES)) // Selo Coelho
-        {
-            if(Selos[playerid] == 99)
-            {
-                Selos[playerid] += 250*3;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","coelho",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Coelho!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 290)
-            {
-                Selos[playerid] += 487*3;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","coelho",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Coelho!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else if(Selos[playerid] == 150)
-            {
-                Selos[playerid] += 9999;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","coelho",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Coelho!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-            else{
-                Selos[playerid] += 150;
-                format(str, sizeof(str), "Selos %d", Selos[playerid]);
-                //SendClientMessage(playerid, COLOR_WHITE, str); //Selos
-                AudioInPlayer(playerid, 10.0, 71);
-                ApplyAnimation(playerid,"selos","coelho",4.0, 0, 0, 0, 0, 0, 1);
-                format(str, sizeof(str), "Coelho!", str);
-                PlayerTextDrawSetString(playerid, SelosJutsuTXD[playerid][0], str);
-                PlayerTextDrawShow(playerid, SelosJutsuTXD[playerid][0]);
-            }
-        }
-    }*/
         if (newkeys & KEY_HANDBRAKE)
     {
         // Verifica se o player est? usando algum jutsu que impe?a o uso de selos.
@@ -8620,8 +8594,18 @@ public OnPlayerRequestClass(playerid, classid)
     return 1;
 }
 #include "Includes/Academia/academia.pwn"
+
 public OnPlayerConnect(playerid)
 {
+
+	MissoesNew_OnConnect(playerid); // do shrp_missoes_txd_patched (zera array p/ INVALID)
+    MissoesNew_UIReset(playerid);
+	MissoesNormalOpen[playerid] = 0;
+
+	Daily_OnConnect(playerid);
+
+    ProfServ_OnPlayerConnect(playerid);
+
 
     if(IsPlayerNPC(playerid))
     {
@@ -8632,8 +8616,12 @@ public OnPlayerConnect(playerid)
     }
 
 
+    // Launcher Auth (token -> nick real)
+    LauncherAuth_Begin(playerid);
+
     AcademiaTreinos_InitPlayer(playerid);
     RapidDash_InitPlayer(playerid);
+    QC_InitPlayer(playerid);
     HBCH_Binds_OnConnect(playerid);
     Jutsu_BindReset(playerid);
          // >>> INICIALIZA A SKILLBAR COM OS PADRES
@@ -9417,119 +9405,11 @@ Afk[playerid]=0;
     PlayerTextDrawUseBox(playerid, BotoesStringExame[playerid][1], 1);
     PlayerTextDrawSetProportional(playerid, BotoesStringExame[playerid][1], 1);
     PlayerTextDrawSetSelectable(playerid, BotoesStringExame[playerid][1], 1);
-    // === Missoes Novos === //
-    MissoesNew[playerid][0] = CreatePlayerTextDraw(playerid, 323.000000, 148.000000, "Gato (Rank D)");
-    PlayerTextDrawFont(playerid, MissoesNew[playerid][0], 1);
-    PlayerTextDrawLetterSize(playerid, MissoesNew[playerid][0], 0.366666, 1.400000);
-    PlayerTextDrawTextSize(playerid, MissoesNew[playerid][0], 629.500000, 298.000000);
-    PlayerTextDrawSetOutline(playerid, MissoesNew[playerid][0], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesNew[playerid][0], 0);
-    PlayerTextDrawAlignment(playerid, MissoesNew[playerid][0], 2);
-    PlayerTextDrawColor(playerid, MissoesNew[playerid][0], 255);
-    PlayerTextDrawBackgroundColor(playerid, MissoesNew[playerid][0], 0);
-    PlayerTextDrawBoxColor(playerid, MissoesNew[playerid][0], 0);
-    PlayerTextDrawUseBox(playerid, MissoesNew[playerid][0], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesNew[playerid][0], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesNew[playerid][0], 0);
+        // === Missoes Novos (movido para Includes/Missoes/shrp_missoes_txd.inc) ===
+    // Missoes (painel novo) - PTD criado sob demanda (evita estourar limite de PlayerTextDraw)
+    for(new _m = 0; _m < 8; _m++) MissoesNew[playerid][_m] = PlayerText:INVALID_TEXT_DRAW;
 
-    MissoesNew[playerid][1] = CreatePlayerTextDraw(playerid, 323.000000, 169.000000, "Houve uma recente crise interna na area de coleta de lixo da vila.");
-    PlayerTextDrawFont(playerid, MissoesNew[playerid][1], 1);
-    PlayerTextDrawLetterSize(playerid, MissoesNew[playerid][1], 0.245833, 1.400000);
-    PlayerTextDrawTextSize(playerid, MissoesNew[playerid][1], 629.500000, 298.000000);
-    PlayerTextDrawSetOutline(playerid, MissoesNew[playerid][1], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesNew[playerid][1], 0);
-    PlayerTextDrawAlignment(playerid, MissoesNew[playerid][1], 2);
-    PlayerTextDrawColor(playerid, MissoesNew[playerid][1], 255);
-    PlayerTextDrawBackgroundColor(playerid, MissoesNew[playerid][1], 0);
-    PlayerTextDrawBoxColor(playerid, MissoesNew[playerid][1], 0);
-    PlayerTextDrawUseBox(playerid, MissoesNew[playerid][1], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesNew[playerid][1], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesNew[playerid][1], 0);
-
-    MissoesNew[playerid][2] = CreatePlayerTextDraw(playerid, 243.000000, 294.000000, "1.000 Ryos");
-    PlayerTextDrawFont(playerid, MissoesNew[playerid][2], 1);
-    PlayerTextDrawLetterSize(playerid, MissoesNew[playerid][2], 0.200000, 1.600000);
-    PlayerTextDrawTextSize(playerid, MissoesNew[playerid][2], 629.500000, 298.000000);
-    PlayerTextDrawSetOutline(playerid, MissoesNew[playerid][2], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesNew[playerid][2], 0);
-    PlayerTextDrawAlignment(playerid, MissoesNew[playerid][2], 2);
-    PlayerTextDrawColor(playerid, MissoesNew[playerid][2], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesNew[playerid][2], 0);
-    PlayerTextDrawBoxColor(playerid, MissoesNew[playerid][2], 0);
-    PlayerTextDrawUseBox(playerid, MissoesNew[playerid][2], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesNew[playerid][2], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesNew[playerid][2], 0);
-
-    MissoesNew[playerid][3] = CreatePlayerTextDraw(playerid, 302.000000, 294.000000, "1.000 XP");
-    PlayerTextDrawFont(playerid, MissoesNew[playerid][3], 1);
-    PlayerTextDrawLetterSize(playerid, MissoesNew[playerid][3], 0.200000, 1.600000);
-    PlayerTextDrawTextSize(playerid, MissoesNew[playerid][3], 629.500000, 298.000000);
-    PlayerTextDrawSetOutline(playerid, MissoesNew[playerid][3], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesNew[playerid][3], 0);
-    PlayerTextDrawAlignment(playerid, MissoesNew[playerid][3], 2);
-    PlayerTextDrawColor(playerid, MissoesNew[playerid][3], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesNew[playerid][3], 0);
-    PlayerTextDrawBoxColor(playerid, MissoesNew[playerid][3], 0);
-    PlayerTextDrawUseBox(playerid, MissoesNew[playerid][3], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesNew[playerid][3], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesNew[playerid][3], 0);
-
-    MissoesNew[playerid][4] = CreatePlayerTextDraw(playerid, 384.000000, 295.000000, "1.000 XP");
-    PlayerTextDrawFont(playerid, MissoesNew[playerid][4], 1);
-    PlayerTextDrawLetterSize(playerid, MissoesNew[playerid][4], 0.154166, 1.600000);
-    PlayerTextDrawTextSize(playerid, MissoesNew[playerid][4], 629.500000, 298.000000);
-    PlayerTextDrawSetOutline(playerid, MissoesNew[playerid][4], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesNew[playerid][4], 0);
-    PlayerTextDrawAlignment(playerid, MissoesNew[playerid][4], 2);
-    PlayerTextDrawColor(playerid, MissoesNew[playerid][4], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesNew[playerid][4], 0);
-    PlayerTextDrawBoxColor(playerid, MissoesNew[playerid][4], 0);
-    PlayerTextDrawUseBox(playerid, MissoesNew[playerid][4], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesNew[playerid][4], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesNew[playerid][4], 0);
-
-    MissoesNew[playerid][5] = CreatePlayerTextDraw(playerid, 416.000000, 295.000000, "1.000 XP");
-    PlayerTextDrawFont(playerid, MissoesNew[playerid][5], 1);
-    PlayerTextDrawLetterSize(playerid, MissoesNew[playerid][5], 0.154166, 1.600000);
-    PlayerTextDrawTextSize(playerid, MissoesNew[playerid][5], 629.500000, 298.000000);
-    PlayerTextDrawSetOutline(playerid, MissoesNew[playerid][5], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesNew[playerid][5], 0);
-    PlayerTextDrawAlignment(playerid, MissoesNew[playerid][5], 2);
-    PlayerTextDrawColor(playerid, MissoesNew[playerid][5], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesNew[playerid][5], 0);
-    PlayerTextDrawBoxColor(playerid, MissoesNew[playerid][5], 0);
-    PlayerTextDrawUseBox(playerid, MissoesNew[playerid][5], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesNew[playerid][5], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesNew[playerid][5], 0);
-
-    MissoesNew[playerid][6] = CreatePlayerTextDraw(playerid, 260.000000, 329.000000, "_");
-    PlayerTextDrawFont(playerid, MissoesNew[playerid][6], 2);
-    PlayerTextDrawLetterSize(playerid, MissoesNew[playerid][6], 0.258332, 1.750000);
-    PlayerTextDrawTextSize(playerid, MissoesNew[playerid][6], 11.000000, 64.000000);
-    PlayerTextDrawSetOutline(playerid, MissoesNew[playerid][6], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesNew[playerid][6], 0);
-    PlayerTextDrawAlignment(playerid, MissoesNew[playerid][6], 2);
-    PlayerTextDrawColor(playerid, MissoesNew[playerid][6], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesNew[playerid][6], 255);
-    PlayerTextDrawBoxColor(playerid, MissoesNew[playerid][6], 0);
-    PlayerTextDrawUseBox(playerid, MissoesNew[playerid][6], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesNew[playerid][6], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesNew[playerid][6], 1);
-
-    MissoesNew[playerid][7] = CreatePlayerTextDraw(playerid, 394.000000, 329.000000, "_");
-    PlayerTextDrawFont(playerid, MissoesNew[playerid][7], 2);
-    PlayerTextDrawLetterSize(playerid, MissoesNew[playerid][7], 0.258332, 1.750000);
-    PlayerTextDrawTextSize(playerid, MissoesNew[playerid][7], 11.000000, 64.000000);
-    PlayerTextDrawSetOutline(playerid, MissoesNew[playerid][7], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesNew[playerid][7], 0);
-    PlayerTextDrawAlignment(playerid, MissoesNew[playerid][7], 2);
-    PlayerTextDrawColor(playerid, MissoesNew[playerid][7], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesNew[playerid][7], 255);
-    PlayerTextDrawBoxColor(playerid, MissoesNew[playerid][7], 0);
-    PlayerTextDrawUseBox(playerid, MissoesNew[playerid][7], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesNew[playerid][7], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesNew[playerid][7], 1);
-    // === Inicio Ryos e XP === //
+// === Inicio Ryos e XP === //
     TxdDamage[playerid][0] = CreatePlayerTextDraw(playerid, 49.000000, 275.000000, "_");
     PlayerTextDrawFont(playerid, TxdDamage[playerid][0], 1);
     PlayerTextDrawLetterSize(playerid, TxdDamage[playerid][0], 0.204165, 1.350000);
@@ -11577,301 +11457,9 @@ Afk[playerid]=0;
     PlayerTextDrawUseBox(playerid, InventRyos[playerid][0], 1);
     PlayerTextDrawSetProportional(playerid, InventRyos[playerid][0], 1);
     PlayerTextDrawSetSelectable(playerid, InventRyos[playerid][0], 0);
-    //==== Inicio TextDraw Missoes Kage e Vila ====//
-    MissoesVilaTXD[playerid][0] = CreatePlayerTextDraw(playerid, 36.000000, 23.000000, "Missao:Pegar");
-    PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][0], 4);
-    PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][0], 0.600000, 2.000000);
-    PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][0], 580.500000, 430.000000);
-    PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][0], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][0], 0);
-    PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][0], 1);
-    PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][0], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][0], 255);
-    PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][0], 50);
-    PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][0], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][0], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][0], 0);
-
-    MissoesVilaTXD[playerid][1] = CreatePlayerTextDraw(playerid, 312.000000, 170.000000, "Missao:Nome");
-    PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][1], 1);
-    PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][1], 0.287499, 1.150000);
-    PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][1], 537.000000, 412.500000);
-    PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][1], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][1], 0);
-    PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][1], 2);
-    PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][1], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][1], 0);
-    PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][1], 1);
-    PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][1], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][1], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][1], 0);
-
-    MissoesVilaTXD[playerid][2] = CreatePlayerTextDraw(playerid, 317.000000, 197.000000, "MissaoDescricao");
-    PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][2], 1);
-    PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][2], 0.270833, 1.150000);
-    PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][2], 197.000000, 120.000000);
-    PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][2], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][2], 0);
-    PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][2], 2);
-    PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][2], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][2], 0);
-    PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][2], 0);
-    PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][2], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][2], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][2], 0);
-
-    MissoesVilaTXD[playerid][3] = CreatePlayerTextDraw(playerid, 247.000000, 319.000000, "Invent:BotaoP");
-    PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][3], 4);
-    PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][3], 0.600000, 2.000000);
-    PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][3], 74.500000, 34.000000);
-    PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][3], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][3], 0);
-    PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][3], 1);
-    PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][3], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][3], 255);
-    PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][3], 50);
-    PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][3], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][3], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][3], 0);
-
-    MissoesVilaTXD[playerid][4] = CreatePlayerTextDraw(playerid, 337.000000, 319.000000, "Invent:BotaoPP");
-    PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][4], 4);
-    PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][4], 0.600000, 2.000000);
-    PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][4], 74.500000, 34.000000);
-    PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][4], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][4], 0);
-    PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][4], 1);
-    PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][4], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][4], 255);
-    PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][4], 50);
-    PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][4], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][4], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][4], 0);
-
-    MissoesVilaTXD[playerid][5] = CreatePlayerTextDraw(playerid, 292.000000, 331.000000, "Aceitar");
-    PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][5], 1);
-    PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][5], 0.262500, 1.499999);
-    PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][5], 10.500000, 44.000000);
-    PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][5], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][5], 4);
-    PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][5], 2);
-    PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][5], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][5], 65);
-    PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][5], 0);
-    PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][5], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][5], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][5], 1);
-
-    MissoesVilaTXD[playerid][6] = CreatePlayerTextDraw(playerid, 368.000000, 331.000000, "Recusar");
-    PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][6], 1);
-    PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][6], 0.245833, 1.549999);
-    PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][6], 10.500000, 44.000000);
-    PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][6], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][6], 4);
-    PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][6], 2);
-    PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][6], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][6], 65);
-    PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][6], 0);
-    PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][6], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][6], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][6], 1);
-
-    MissoesVilaTXD[playerid][7] = CreatePlayerTextDraw(playerid, 282.000000, 275.000000, "MRYO");
-    PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][7], 1);
-    PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][7], 0.287499, 1.149999);
-    PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][7], 537.000000, 412.500000);
-    PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][7], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][7], 0);
-    PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][7], 2);
-    PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][7], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][7], 0);
-    PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][7], 1);
-    PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][7], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][7], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][7], 0);
-
-    MissoesVilaTXD[playerid][8] = CreatePlayerTextDraw(playerid, 289.000000, 295.000000, "MXP");
-    PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][8], 1);
-    PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][8], 0.287499, 1.149999);
-    PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][8], 537.000000, 412.500000);
-    PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][8], 1);
-    PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][8], 0);
-    PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][8], 2);
-    PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][8], -1);
-    PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][8], 0);
-    PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][8], 1);
-    PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][8], 1);
-    PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][8], 1);
-    PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][8], 0);
-    //== Finalizar Missoes TXD
-    FinalizarMissao[playerid][0] = CreatePlayerTextDraw(playerid, 303.000000, 21.000000, "Invent:Sucesso");
-    PlayerTextDrawFont(playerid, FinalizarMissao[playerid][0], 4);
-    PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][0], 0.600000, 2.000000);
-    PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][0], 510.000000, 395.000000);
-    PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][0], 1);
-    PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][0], 0);
-    PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][0], 1);
-    PlayerTextDrawColor(playerid, FinalizarMissao[playerid][0], -1);
-    PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][0], 255);
-    PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][0], 50);
-    PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][0], 1);
-    PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][0], 1);
-    PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][0], 0);
-
-    FinalizarMissao[playerid][1] = CreatePlayerTextDraw(playerid, -1.000000, 0.000000, "Missao:Completa");
-    PlayerTextDrawFont(playerid, FinalizarMissao[playerid][1], 4);
-    PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][1], 0.600000, 2.000000);
-    PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][1], 643.500000, 451.000000);
-    PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][1], 1);
-    PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][1], 0);
-    PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][1], 1);
-    PlayerTextDrawColor(playerid, FinalizarMissao[playerid][1], -1);
-    PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][1], 255);
-    PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][1], 50);
-    PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][1], 1);
-    PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][1], 1);
-    PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][1], 0);
-
-    FinalizarMissao[playerid][2] = CreatePlayerTextDraw(playerid, 77.000000, 164.000000, "ranks:A");
-    PlayerTextDrawFont(playerid, FinalizarMissao[playerid][2], 4);
-    PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][2], 0.600000, 2.000000);
-    PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][2], 286.500000, 215.500000);
-    PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][2], 1);
-    PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][2], 0);
-    PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][2], 1);
-    PlayerTextDrawColor(playerid, FinalizarMissao[playerid][2], -1);
-    PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][2], 255);
-    PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][2], 50);
-    PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][2], 1);
-    PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][2], 1);
-    PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][2], 0);
-
-    FinalizarMissao[playerid][3] = CreatePlayerTextDraw(playerid, 77.000000, 164.000000, "ranks:B");
-    PlayerTextDrawFont(playerid, FinalizarMissao[playerid][3], 4);
-    PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][3], 0.600000, 2.000000);
-    PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][3], 286.500000, 215.500000);
-    PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][3], 1);
-    PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][3], 0);
-    PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][3], 1);
-    PlayerTextDrawColor(playerid, FinalizarMissao[playerid][3], -1);
-    PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][3], 255);
-    PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][3], 50);
-    PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][3], 1);
-    PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][3], 1);
-    PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][3], 0);
-
-    FinalizarMissao[playerid][4] = CreatePlayerTextDraw(playerid, 77.000000, 164.000000, "ranks:C");
-    PlayerTextDrawFont(playerid, FinalizarMissao[playerid][4], 4);
-    PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][4], 0.600000, 2.000000);
-    PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][4], 286.500000, 215.500000);
-    PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][4], 1);
-    PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][4], 0);
-    PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][4], 1);
-    PlayerTextDrawColor(playerid, FinalizarMissao[playerid][4], -1);
-    PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][4], 255);
-    PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][4], 50);
-    PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][4], 1);
-    PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][4], 1);
-    PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][4], 0);
-
-    FinalizarMissao[playerid][5] = CreatePlayerTextDraw(playerid, 77.000000, 164.000000, "ranks:D");
-    PlayerTextDrawFont(playerid, FinalizarMissao[playerid][5], 4);
-    PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][5], 0.600000, 2.000000);
-    PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][5], 286.500000, 215.500000);
-    PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][5], 1);
-    PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][5], 0);
-    PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][5], 1);
-    PlayerTextDrawColor(playerid, FinalizarMissao[playerid][5], -1);
-    PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][5], 255);
-    PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][5], 50);
-    PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][5], 1);
-    PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][5], 1);
-    PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][5], 0);
-
-    FinalizarMissao[playerid][6] = CreatePlayerTextDraw(playerid, 77.000000, 164.000000, "ranks:S");
-    PlayerTextDrawFont(playerid, FinalizarMissao[playerid][6], 4);
-    PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][6], 0.600000, 2.000000);
-    PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][6], 286.500000, 215.500000);
-    PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][6], 1);
-    PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][6], 0);
-    PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][6], 1);
-    PlayerTextDrawColor(playerid, FinalizarMissao[playerid][6], -1);
-    PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][6], 255);
-    PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][6], 50);
-    PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][6], 1);
-    PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][6], 1);
-    PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][6], 0);
-
-    FinalizarMissao[playerid][7] = CreatePlayerTextDraw(playerid, 380.000000, 57.000000, "ranks:Carimbo");
-    PlayerTextDrawFont(playerid, FinalizarMissao[playerid][7], 4);
-    PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][7], 0.600000, 2.000000);
-    PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][7], 75.000000, 63.000000);
-    PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][7], 1);
-    PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][7], 0);
-    PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][7], 1);
-    PlayerTextDrawColor(playerid, FinalizarMissao[playerid][7], -1);
-    PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][7], 255);
-    PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][7], 50);
-    PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][7], 1);
-    PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][7], 1);
-    PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][7], 0);
-
-    FinalizarMissao[playerid][8] = CreatePlayerTextDraw(playerid, 548.000000, 275.000000, "RGM1");
-    PlayerTextDrawFont(playerid, FinalizarMissao[playerid][8], 2);
-    PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][8], 0.562500, 2.149999);
-    PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][8], 400.000000, 17.000000);
-    PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][8], 1);
-    PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][8], 0);
-    PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][8], 2);
-    PlayerTextDrawColor(playerid, FinalizarMissao[playerid][8], -1);
-    PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][8], 255);
-    PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][8], 0);
-    PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][8], 1);
-    PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][8], 1);
-    PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][8], 0);
-
-    FinalizarMissao[playerid][9] = CreatePlayerTextDraw(playerid, 548.000000, 314.000000, "XPG0");
-    PlayerTextDrawFont(playerid, FinalizarMissao[playerid][9], 2);
-    PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][9], 0.562500, 2.149999);
-    PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][9], 400.000000, 17.000000);
-    PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][9], 1);
-    PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][9], 0);
-    PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][9], 2);
-    PlayerTextDrawColor(playerid, FinalizarMissao[playerid][9], -1);
-    PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][9], 255);
-    PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][9], 0);
-    PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][9], 1);
-    PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][9], 1);
-    PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][9], 0);
-
-    FinalizarMissao[playerid][10] = CreatePlayerTextDraw(playerid, 548.000000, 350.000000, "XPG1");
-    PlayerTextDrawFont(playerid, FinalizarMissao[playerid][10], 2);
-    PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][10], 0.562500, 2.149999);
-    PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][10], 400.000000, 17.000000);
-    PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][10], 1);
-    PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][10], 0);
-    PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][10], 2);
-    PlayerTextDrawColor(playerid, FinalizarMissao[playerid][10], -1);
-    PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][10], 255);
-    PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][10], 0);
-    PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][10], 1);
-    PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][10], 1);
-    PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][10], 0);
-
-    FinalizarMissao[playerid][11] = CreatePlayerTextDraw(playerid, 169.000000, 17.000000, "RGM0");
-    PlayerTextDrawFont(playerid, FinalizarMissao[playerid][11], 2);
-    PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][11], 0.387500, 2.099999);
-    PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][11], 400.000000, 17.000000);
-    PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][11], 1);
-    PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][11], 0);
-    PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][11], 2);
-    PlayerTextDrawColor(playerid, FinalizarMissao[playerid][11], -1);
-    PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][11], 255);
-    PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][11], 0);
-    PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][11], 1);
-    PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][11], 1);
-    PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][11], 0);
-    //==== Final TextDraw Missoes Kage e Vila ====//
+        //==== Missoes Kage e Vila (PTD) ====//
+    // Criacao movida para SOB DEMANDA para evitar estourar o limite de PlayerTextDraw e quebrar HUD/Skillbar.
+    MissoesLegacyUI_Reset(playerid);
     //==== Inicio TextDraw Selos e Jutsu String ====//
     SelosJutsuTXD[playerid][0] = CreatePlayerTextDraw(playerid, 315.768402, 419.249969, "99999999999999999999999999999999999999");
     PlayerTextDrawLetterSize(playerid, SelosJutsuTXD[playerid][0], 0.194786, 1.664165);
@@ -12901,8 +12489,11 @@ ShowMainMenuDialog(playerid, frame)
     {
         case 1:
         {
-            InterpolateCameraPos(playerid, 2040.469238, 1937.429321, 254.957138, 2241.274902, 2123.368896, 118.615013, 10000);
-            InterpolateCameraLookAt(playerid, 2044.025512, 1940.353149, 253.006744, 2244.686035, 2126.111328, 116.197624, 10000);
+            InterpolateCameraPos(playerid, 2811.26, -3452.54, 22.58, 2833.28, -3421.60, 6.39, 15000);
+			InterpolateCameraLookAt(playerid, 2831.91, -3419.64, -8.89, 2837.39, -3377.99, -17.71, 15000);
+
+            //InterpolateCameraPos(playerid, 2040.469238, 1937.429321, 254.957138, 2241.274902, 2123.368896, 118.615013, 10000);
+            //InterpolateCameraLookAt(playerid, 2044.025512, 1940.353149, 253.006744, 2244.686035, 2126.111328, 116.197624, 10000);
             IdentMusicaSL[playerid] = Audio_Play(playerid, 138);
             //PlayAudioStreamForPlayer(playerid, "https://cdn.discordapp.com/attachments/1214215300036431952/1265553971494522982/tela_do_SL.mp3");
             ClearChatbox(playerid);
@@ -12913,7 +12504,7 @@ ShowMainMenuDialog(playerid, frame)
             TextDrawHideForPlayer(playerid, BotaoRegistro[0]);
             SelectTextDraw(playerid, 0xFF0000FF);
             gPlayerLogTries[playerid] = 0;
-            SetPlayerVirtualWorld(playerid, 20);
+            SetPlayerVirtualWorld(playerid, 0);
         }
         case 2:
         {
@@ -13110,6 +12701,7 @@ resetPlayerVariables(playerid)
     Info[playerid][pCamping] = 0;               Info[playerid][pBlockG] = 0;
     Info[playerid][pAdiccion] = 0;              Info[playerid][pPackages] = 0;
     Info[playerid][pClan] = 0;                  Info[playerid][pClanLider] = 0;
+    Info[playerid][pClanNivel] = 0;
     Info[playerid][pLeader] = 0;                Info[playerid][pMember] = 0;
     Info[playerid][pDivision] = 0;              Info[playerid][pFMember] = 255;
     Info[playerid][pDPHours] = 0;               Info[playerid][pDPTime] = 0;
@@ -13753,6 +13345,7 @@ function ConvertAccount(playerid)
             INI_WriteInt(File,"Crates",Info[playerid][pCrates]);
             INI_WriteInt(File,"Adic",Info[playerid][pAdiccion]);
             INI_WriteInt(File,"Clan",Info[playerid][pClan]);
+            INI_WriteInt(File,"ClanNivel",Info[playerid][pClanNivel]);
             INI_WriteInt(File,"LiderReligioso",Info[playerid][pClanLider]);
             INI_WriteInt(File,"Leader",Info[playerid][pLeader]);
             INI_WriteInt(File,"Member",Info[playerid][pMember]);
@@ -14092,6 +13685,12 @@ function ConvertAccount(playerid)
 public OnPlayerDisconnect(playerid, reason)
 {
 
+    Daily_OnDisconnect(playerid, reason);
+
+    ProfServ_OnPlayerDisconnect(playerid);
+
+
+    LauncherAuth_Reset(playerid);
 
     MenuNpc_OnPlayerDisconnect(playerid);
 
@@ -14103,6 +13702,9 @@ public OnPlayerDisconnect(playerid, reason)
             CallLocalFunction("Bandido_OnNpcDisconnect", "i", playerid);
         return 1; // FCNPC: evita limpeza de player em NPC (crash)
     }
+
+    // Quebra-Combo (DEFENSA)
+    QC_InitPlayer(playerid);
     // Se algum NPC bandido estava com este player como alvo/aggro, solta imediatamente.
     if(funcidx("Bandido_OnPlayerGone") != -1) CallLocalFunction("Bandido_OnPlayerGone", "i", playerid);
     AcademiaTreinos_InitPlayer(playerid);
@@ -15102,10 +14704,18 @@ new Ping = GetPlayerPing(playerid);
 
 public OnPlayerDeath(playerid, killerid, reason)
 {
+
+      Daily_OnDeath(playerid, killerid, reason);
+
     return 1;
 }
 public OnPlayerSpawn(playerid)
 {
+
+
+	AcaM1_OnPlayerSpawn(playerid);
+
+
     if(IsPlayerNPC(playerid)) return 1;
     HBCH_Binds_OnSpawn(playerid);
     PreloadAnims(playerid);
@@ -15387,196 +14997,11 @@ Log(sz_fileName[], sz_input[]) {
 //
 public OnPlayerEnterCheckpoint(playerid)
 {
-    // === Kages Miss?o Kirigakure
-    if(RamenCPKageKiri[playerid] && FinalizandoKageMissao[playerid] == 1)
-    {
-        FinalizandoKageMissao[playerid] = 2;
-        SendClientMessage(playerid, -1, "{AB7C4E}(MISS?O) Entregue o relatorio na sala do Kage");
-    }
-    if(RamenCPKageIwag[playerid] && FinalizandoKageMissao[playerid] == 5)
-    {
-        FinalizandoKageMissao[playerid] = 6;
-        SendClientMessage(playerid, -1, "{AB7C4E}(MISS?O) Entregue o relatorio na sala do Kage");
-        SetPlayerCheckpoint(playerid, -1731.9889, 1742.6711, 135.4218, 1.0);
-    }
-    if(RamenCPKageKumo[playerid] && FinalizandoKageMissao[playerid] == 7)
-    {
-        FinalizandoKageMissao[playerid] = 8;
-        UsandoKit[playerid] = 1;
-        SendClientMessage(playerid, -1, "{AB7C4E}(MISS?O) Entregue o relatorio na sala do Kage");
-        SetTimerEx("LimparKitU", 500, false, "d", playerid);
-    }
-    // CheckPoint Miss?o Kage Ingredientes
-    if(KonohaCPIng[playerid])
-    {
-        if(IdentEntregaMissaoKage[playerid] == 1) // Ingredientes Konoha
-        {
-            ApplyAnimation(playerid, "BOMBER", "BOM_Plant", 4.1, 0, 0, 0, 0, 1000, 1);
-            RemovePlayerAttachedObject(playerid, 9);
-            IdentEntregaMissaoKage[playerid] = 2;
-        }
-        if(IdentEntregaMissaoKage[playerid] == 5) // Ingredientes Kiri
-        {
-            ApplyAnimation(playerid, "BOMBER", "BOM_Plant", 4.1, 0, 0, 0, 0, 1000, 1);
-            RemovePlayerAttachedObject(playerid, 9);
-            IdentEntregaMissaoKage[playerid] = 6;
-        }
-        if(IdentEntregaMissaoKage[playerid] == 3) // Medicamentos Konoha
-        {
-            ApplyAnimation(playerid, "BOMBER", "BOM_Plant", 4.1, 0, 0, 0, 0, 1000, 1);
-            RemovePlayerAttachedObject(playerid, 9);
-            IdentEntregaMissaoKage[playerid] = 4;
-        }
-        if(IdentEntregaMissaoKage[playerid] == 7) // Medicamentos Kiri
-        {
-            ApplyAnimation(playerid, "BOMBER", "BOM_Plant", 4.1, 0, 0, 0, 0, 1000, 1);
-            RemovePlayerAttachedObject(playerid, 9);
-            IdentEntregaMissaoKage[playerid] = 8;
-        }
-    }
-    // Inicio dos CheckPoint da Miss?o de Guarda
-    else if(GuardaKonohaCP[playerid])
-    {
-        if(GuardaKiriNM[playerid] >= 1){
-            GuardaKonohaNM[playerid] ++;
-            GivePlayerCash(playerid, 11);
-            GivePlayerExperiencia(playerid, 19);
-            SubirDLevel(playerid);
-            TimingGuardaKonoha[playerid] = SetTimerEx("KonohaCP2", 100, 1, "i", playerid);
-        }
-    }
-    else if(GuardaKiriCP[playerid])
-    {
-        if(GuardaKiriNM[playerid] >= 1){
-            GuardaKiriNM[playerid] ++;
-            GivePlayerCash(playerid, 11);
-            GivePlayerExperiencia(playerid, 19);
-            SubirDLevel(playerid);
-            TimingGuardaKiri[playerid] = SetTimerEx("KiriCP2", 100, 1, "i", playerid);
-        }
-    }
-    // Final dos CheckPoint da Miss?o de Guarda
 
-    // === Nevada Excessod e Neve === //
-    if(NevadaCPMissao[playerid])
-    {
-        if(IdentMissaoNormal[playerid] == 1){
-            NevadaCPMissaoNM[playerid] ++;
-            TimingNevadaCP[playerid] = SetTimerEx("NumerosNevacaCP", 100, 1, "i", playerid);
-        }
-    }
-    if(NevadaPeixesCP[playerid])
-    {
-        if(IdentMissaoNormal[playerid] == 2){
-            MissaoNormalFinalizada[playerid] = 1;
-        }
-        //TimingCPMissao1[playerid] = SetTimerEx("MissaoPeixesNevada", 100, 1, "i", playerid);
-    }
-    if(KirigakureMissao1CP[playerid])
-    {
-        if(IdentMissaoNormal[playerid] == 3){
-            new stringki[200];
-            MissaoNormalFinalizada[playerid] = 1;
-            format(stringki, sizeof(stringki), "{AB7C4E}(MISS?O) {FFFFFF}Voc? entregou a {AB7C4E}carta{FFFFFF} ao assistente entregue o {AB7C4E}relatorio{FFFFFF} na academia!");
-            SendClientMessage(playerid, COLOR_WHITE, stringki);
-        }
-    }
-    // === Nevada Excessod e Neve Final === //
-    // === Kirigakure Missoes Sensei === //
-    if(KirigakureHospitalCP[playerid])
-    {
-        if(IdentMissaoNormal[playerid] == 5){
-            new stringki[200];
-            MissaoNormalFinalizada[playerid] = 1;
-            format(stringki, sizeof(stringki), "{AB7C4E}(MISS?O) {FFFFFF}Entregue a {AB7C4E}encomenda{FFFFFF} ao {AB7C4E}sensei{FFFFFF} na academia ninja.");
-            SendClientMessage(playerid, COLOR_WHITE, stringki);
-        }
-    }
-    // === Kirigakure Missoes Sensei Final === //
-    // === Iwagakure Missoes Sensei === //
-    //Delegacia
-    new stringiwa[168];
-    if(IwagakureDelegaciaCP[playerid])
-    {
-        if(IdentMissaoNormal[playerid] == 6 && IwagakureIdentMissao[playerid] == 1) // Primeira ida Delegacia
-        {
-            IwagakureIdentMissao[playerid] = 2;
-            IwagakureCPNum[playerid] = 2;
-            format(stringiwa, sizeof(stringiwa), "{AB7C4E}(MISS?O) {FFFFFF}Voc? pegou os {AB7C4E}documentos{FFFFFF} que estava em cima da mesa. Leve para academia!");
-            SendClientMessage(playerid, COLOR_WHITE, stringiwa);
-            TimingIwagakureCP[playerid] = SetTimerEx("IwagakureCPS", 200, 0, "i", playerid);
-        }
-        else if(IdentMissaoNormal[playerid] == 6 && IwagakureIdentMissao[playerid] == 2) // Primeira Volta Academia
-        {
-            IwagakureIdentMissao[playerid] = 3;
-            IwagakureCPNum[playerid] = 3;
-            format(stringiwa, sizeof(stringiwa), "{AB7C4E}(MISS?O) {FFFFFF}Voc? entregou os {AB7C4E}documentos e logo recebe os documentos assinados{FFFFFF}. Leve para a delegacia!");
-            SendClientMessage(playerid, COLOR_WHITE, stringiwa);
-            TimingIwagakureCP[playerid] = SetTimerEx("IwagakureCPS", 250, 0, "i", playerid);
-        }
-        else if(IdentMissaoNormal[playerid] == 6 && IwagakureIdentMissao[playerid] == 3) // Segunda ida Delegacia
-        {
-            MissaoNormalFinalizada[playerid] = 1;
-            IwagakureIdentMissao[playerid] = 4;
-            format(stringiwa, sizeof(stringiwa), "{AB7C4E}(MISS?O) {FFFFFF}Entregue o {AB7C4E}relatorio da miss?o{FFFFFF} na academia!");
-            SendClientMessage(playerid, COLOR_WHITE, stringiwa);
-        }
-    }
-    //Ichiraku
-    if(IwagakureIchirakuCP[playerid]){
-         if(IdentMissaoNormal[playerid] == 7 && IwagakureIchirakuNUM[playerid] == 1){
-            IwagakureIchirakuNUM[playerid] = 2;
-            format(stringiwa, sizeof(stringiwa), "{AB7C4E}(MISS?O) Leve a encomenda de volta pra vila e entregue ao {AB7C4E}Ichiraku de Iwagakure{FFFFFF}!");
-            SendClientMessage(playerid, COLOR_WHITE, stringiwa);
-            TimingIwagakureIchirakuCP[playerid] = SetTimerEx("IwagakureIchirakuCPS", 200, 1, "i", playerid);
-         }
-         else if(IdentMissaoNormal[playerid] == 7 && IwagakureIchirakuNUM[playerid] == 2)
-         {
-            MissaoNormalFinalizada[playerid] = 1;
-            IwagakureIchirakuNUM[playerid] = 3;
-            format(stringiwa, sizeof(stringiwa), "{AB7C4E}(MISS?O) {FFFFFF}Entregue o {AB7C4E}relatorio da miss?o{FFFFFF} na academia!");
-            SendClientMessage(playerid, COLOR_WHITE, stringiwa);
-         }
-    }
-    //Tobby Desaparecido
-    if(CPDogDP[playerid] && MissaoTobyIdent[playerid] == 6){
-        new dogPos = random(2);
-        switch(dogPos)
-        {
-            case 0:{
-                MissaoTobyIdent[playerid] = 1;
-                DogTobbyObj[playerid] = CreateDynamicActor(298, -1362.1615, 1761.4929, 29.1797+0.2);
-                ApplyDynamicActorAnimation(DogTobbyObj[playerid], "Dog", "dog_uivo", 4.1, 0, 0, 1, 1, 1);
-            }
-            case 1:{
-                MissaoTobyIdent[playerid] = 2;
-                DogTobbyObj[playerid] = CreateDynamicActor(298, -1846.6541, 1957.2054, 22.1299+0.2);
-                ApplyDynamicActorAnimation(DogTobbyObj[playerid], "Dog", "dog_uivo", 4.1, 0, 0, 1, 1, 1);
-            }
-        }
-        SetTimerEx("CheckpoinTobby", 250, false, "d", playerid);
-        format(stringiwa, sizeof(stringiwa), "{AB7C4E}(MISS?O) O cachorro possui pelagem {FFFFFF}Marrom com Branco{AB7C4E}. E se chama {FFFFFF}Tobby{AB7C4E}. Encontre-o!");
-        SendClientMessage(playerid, COLOR_WHITE, stringiwa);
-    }
-    else if(CPDogTobby[playerid])
-    {
-        if(MissaoTobyIdent[playerid] == 1 || MissaoTobyIdent[playerid] == 2){
-            DestroyDynamicActor(DogTobbyObj[playerid]);
-            MissaoTobyIdent[playerid] = 3;
-            format(stringiwa, sizeof(stringiwa), "{AB7C4E}(MISS?O) Voc? encontrou {FFFFFF}Tobby{AB7C4E}! Devolva a delegacia antes que ele fuja novamente!");
-            SendClientMessage(playerid, COLOR_WHITE, stringiwa);
-            SetTimerEx("CheckpoinTobby", 250, false, "d", playerid);
-        }
-    }
-    if(CPDogFinalizar[playerid] && MissaoTobyIdent[playerid] == 4)
-    {
-        MissaoTobyIdent[playerid] = 5;
-        MissaoNormalFinalizada[playerid] = 1;
-        format(stringiwa, sizeof(stringiwa), "{AB7C4E}(MISS?O) Entregue o {FFFFFF}Relatorio{AB7C4E}. Na academia de Iwagakure.");
-        SendClientMessage(playerid, COLOR_WHITE, stringiwa);
-    }
-    // === Iwagakure Missoes Sensei Final === //
-    PlayerPlaySound(playerid, 1056, 0.0, 0.0, 0.0);
+        // === Missoes (Kage/Vila/Normal) - movido para Includes/Missoes/shrp_missoes_hooks.inc ===
+    Missoes_OnPlayerEnterCheckpoint(playerid);
+
+PlayerPlaySound(playerid, 1056, 0.0, 0.0, 0.0);
     new carid = GetPlayerVehicleID(playerid), string[128];
     if(GetPVarInt(playerid,"FindJob") == 1)
     {
@@ -18877,33 +18302,7 @@ stock Tags_Save(playerid, iIndex)
     }
     return 1;
 }
-/*function Test(playerid)
-{
-    OnPlayerSavedStats(playerid); // En la funci?n "Test" se guardan los stats. Para saber que est? registrado, pero que no acab? el tutorial.
-    SetPosEx(playerid,2737.6345, -1760.3801, 44.6308,90,0,69); // ?ltimos digitos: Angulo, Interior, Mundo Virtual.
-    InterpolateCameraPos(playerid,2973.0427, -1450.8297, 26.4754, 2877.9119, -1891.2683, 43.6113, 90000, CAMERA_MOVE);
-    InterpolateCameraLookAt(playerid,2807.32178, -1788.97070, 25.96403, 2807.32178, -1788.97070, 35.96403, 90000, CAMERA_MOVE);
-    SetHP(playerid,100);
-    SendClientMessage(playerid, COLOR_BLUED, "[Test de Rol]: Consta de 10 preguntas f?ciles, cuando acabe ser? enviado al tutorial.{FFFFFF} Proximamente.]" );
-    for(new loop=0; loop<8; loop++)  SendClientMessage(playerid, COLOR_WHITE,"");
-    TogglePlayerControllable(playerid, 0);
-    new test0[500];
-    strcat(test0,"1 -Le hablo a un amigo por FB, WSP, etc para que venga a recogerme.\n2 -Voy corriendo y saltando para llegar mas rapido a mi destino.\n3 -Utilizo cheats para darme Teleport.\n");
-    strcat(test0,"4 -Llamo a un taxi o aviso a un amigo IC para que venga a recogerme.\n5 -Le robo el auto sin rol al primer usuario que vea.\n6 -Le pido a un administrador que me lleve repetidas veces.");
-    ShowPlayerDialog(playerid, TEST_0, DIALOG_STYLE_LIST, "{BE81F7}1) ?Que debes hacer si necesitas llegar a un lugar lejano?",test0, "Seleccionar", "");
-} */
-/*function Tutorial_Outside(playerid)
-{
-    for(new loop=0; loop<20; loop++)  SendClientMessage(playerid, COLOR_WHITE,"");
-    TextDrawHideForPlayer(playerid, LoginMenu[0]);
-    TextDrawHideForPlayer(playerid, LoginMenu[1]);
-    TextDrawHideForPlayer(playerid, LoginMenu[8]);
-    ExamGood[playerid] = 0;
-    TutStep[playerid] = 1;
-    TutTime[playerid] = 1;
-    TogglePlayerControllable(playerid, 0);
-    Tutorial_Inside(playerid);
-}*/
+
 function SprayTag_Dialog(iPlayerID, iType)
 {
     new
@@ -19185,10 +18584,14 @@ forward Speedometer(playerid); // Nuevo.
 public OnGameModeInit()
 {
 
+
+    Daily_Init();
     SHRP_NpcAI_Init();
 	MenuNpc_Init();
     Bandido_Init();
     EcoCore_OnGameModeInit();
+    ProfServ_InitAll();
+    SetTimer("ProfServ_Tick", 5000, true);
     CreateDynamicObject(12014, 1248.7744, -1278.8015, 1677.3565, 0, 0, 0);
 
     SetTimer("LoopsSistemaCraft", 1000, true);
@@ -19863,19 +19266,8 @@ public OnGameModeInit()
     TextDrawSetProportional(king2, 1);
     TextDrawSetShadow(king2, 0);
 
-    MissoesBKG[0] = TextDrawCreate(80.000000, -20.000000, "MSS:Int1");
-    TextDrawFont(MissoesBKG[0], 4);
-    TextDrawLetterSize(MissoesBKG[0], 0.600000, 2.000000);
-    TextDrawTextSize(MissoesBKG[0], 500.000000, 500.000000);
-    TextDrawSetOutline(MissoesBKG[0], 1);
-    TextDrawSetShadow(MissoesBKG[0], 0);
-    TextDrawAlignment(MissoesBKG[0], 1);
-    TextDrawColor(MissoesBKG[0], -1);
-    TextDrawBackgroundColor(MissoesBKG[0], 255);
-    TextDrawBoxColor(MissoesBKG[0], 50);
-    TextDrawUseBox(MissoesBKG[0], 1);
-    TextDrawSetProportional(MissoesBKG[0], 1);
-    TextDrawSetSelectable(MissoesBKG[0], 0);
+        // MissoesBKG (movido para Includes/Missoes/shrp_missoes_txd.inc)
+    Missoes_CreateGlobalTextDraws();
 
 /*PRUEBA1 = TextDrawCreate(638.0, 431.0, "~p~SL_");
 TextDrawLetterSize(PRUEBA1, 0.400000, 1.605833);
@@ -21754,7 +21146,7 @@ function BoasVindasSW(playerid)
         case 3: SendClientMessage(playerid, COLOR_GENERAL, "{F81414}SH-RP:{FFFFFF} Bem-vindo, voc? fez login como Gerente.");
         case 4: SendClientMessage(playerid, COLOR_GENERAL, "{F81414}SH-RP:{FFFFFF} Bem-vindo, voc? fez login como STAFF.");
         //4, 5, 6, 1338, 4000, 5000, 6000: SendClientMessage(playerid, -1, def("{00F70C}SH-RP:{FFFFFF} Bem-vindo, voc? est? logado como n?vel de administrador {FF0000}%d{FFFFFF}.", Info[playerid][pAdminZC]));
-        default: SendClientMessage(playerid, COLOR_RED, def("{F81414}SH-RP:{FFFFFF} Bem vindo ao nosso servidor, {5ABAFF}%s{FFFFFF}.", PlayerNameDados(playerid)));
+        default: SendClientMessage(playerid, COLOR_RED, "{F81414}SH-RP:{FFFFFF} Bem vindo ao Shinobi Roleplay");
     }
     return 1;
 }
@@ -21964,6 +21356,7 @@ function CloseDoorIzquierda()
 //economia
 //economia
 #include "Includes/Economia/eco_core.pwn"
+#include "Includes/Profissoes/prof_servico.pwn"
 #include "Includes/Economia/eco_shops.pwn"
 //#include "Includes/Economia/eco_tesouro_patrol.pwn"
 #include "Includes/Economia/eco_kagecmds.pwn"
@@ -22922,8 +22315,53 @@ public OnPlayerEditAttachedObject( playerid, response, index, modelid, boneid,Fl
     Editing[playerid] = 0;
     return 1;
 }
+
+// ======================================================
+// Registro: sorteio automatico de CLA (sem warnings)
+// ======================================================
+stock RegChar_ClanRandom(playerid)
+{
+    if(Info[playerid][pClan] != 0) return 0;
+
+    // 0..11 (grupos de 3 = 25% cada)
+    new SorteioCla = random(12);
+
+    if(SorteioCla <= 2)
+    {
+        Info[playerid][pClan] = 1; // Senju
+        SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Voce recebeu o Cla ({FFFFFF}Senju{AB7C4E}).");
+    }
+    else if(SorteioCla <= 5)
+    {
+        Info[playerid][pClan] = 2; // Uchiha
+        SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Voce recebeu o Cla ({FFFFFF}Uchiha{AB7C4E}).");
+    }
+    else if(SorteioCla <= 8)
+    {
+        Info[playerid][pClan] = 3; // Nara
+        SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Voce recebeu o Cla ({FFFFFF}Nara{AB7C4E}).");
+    }
+    else
+    {
+        Info[playerid][pClan] = 4; // Hyuuga
+        Info[playerid][pClanNivel] = 1; //nivel cl
+        SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Voce recebeu o Cla ({FFFFFF}Hyuuga{AB7C4E}).");
+    }
+    return 1;
+}
+
+
 public OnDialogResponse(playerid, dialogid, response, listitem, inputtext[])
 {
+
+	//missoes
+    if(AcaM1_OnDialogResponse(playerid, dialogid, response, listitem, inputtext)) return 1;
+
+    if(Daily_OnDialogResponse(playerid, dialogid, response, listitem, inputtext)) return 1;
+
+
+
+    if(ProfServ_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
 
     if (MenuNpc_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
 	if (BandidoMenu_OnDialog(playerid, dialogid, response, listitem, inputtext)) return 1;
@@ -23470,6 +22908,8 @@ public OnDialogResponse(playerid, dialogid, response, listitem, inputtext[])
                     format(stringclan, sizeof(stringclan), "{AB7C4E}(AVISO) {FFFFFF}Voc? agora faz parte do clan ({AB7C4E}Hyuuga{FFFFFF})");
                     SendClientMessage(playerid, -1, stringclan);
                     Info[playerid][pClan] = 4;
+                    Info[playerid][pClanNivel] = 1; //nivel cl
+
                 }
             }
         }else{Audio_Play(playerid, 58); ShowPlayerDialog(playerid, DIALOG_CARTACLANI, DIALOG_STYLE_LIST, "{FFFFFF}Escolha de Clan (Inicial)", "Senju\n\
@@ -24829,73 +24269,10 @@ public OnDialogResponse(playerid, dialogid, response, listitem, inputtext[])
             Info[strval(inputtext)][pDPPatente] = 0;
         }else{Audio_Play(playerid, 58);}
     }
-    // === MISS?ES KAGE - IWAGAKURE
-    if(dialogid == DIALOG_KAGEIWAGMISSAORAMEN)
-    {
-        if(response)
-        {
-            Audio_Play(playerid, 58);
-            if(isNumber(inputtext))
-            if(IsPlayerConnected(strval(inputtext)))
-            if(strval(inputtext) == playerid) return SendClientMessage(playerid, -1, "(AVISO) Voc? n?o pode fazer isso com voc? mesmo.");
-            if(Info[strval(inputtext)][pMember] == 3 || Info[strval(inputtext)][pMember] == 6 || Info[strval(inputtext)][pMember] == 7 || Info[strval(inputtext)][pMember] == 5 || Info[strval(inputtext)][pMember] == 8 || Info[strval(inputtext)][pMember] == 9 || Info[strval(inputtext)][pMember] == 10 ||
-               Info[strval(inputtext)][pMember] == 11) return SendClientMessage(playerid, -1, "(AVISO) O ninja n?o faz parte de sua vila.");
-            if(MissaoKageID[strval(inputtext)] != 0) return SendClientMessage(playerid, -1, "{AB7C4E}(KAGE) Esse ninja j? est? com uma miss?o ativa.");
-            if(ProxDetectorS(2.0, playerid, strval(inputtext)))
-            {
-                format(string, sizeof(string), "{AB7C4E}O Kage {FFFFFF}%s{AB7C4E} lhe passou a miss?o de ({FFFFFF}ESTOQUE RAMEN{AB7C4E}).", PlayerNameDados(playerid));
-                SendClientMessage(strval(inputtext), -1, string);
-                AbriuMissaoKage[strval(inputtext)] = 0; // Reseta a Variavel
-                KageQuePassouM[strval(inputtext)] = playerid; // Salva o ID do KAGE
-                MostrarMissoes(strval(inputtext), 5); // MOSTRA A MISS?O
-            }
-        }else{Audio_Play(playerid, 58);}
-    }
-    // === MISS?ES KAGE - KUMOGAKURE
-    if(dialogid == DIALOG_KAGEKUMOMISSAORAMEN)
-        {
-            if(response)
-            {
-                Audio_Play(playerid, 58);
-                if(isNumber(inputtext))
-                if(IsPlayerConnected(strval(inputtext)))
-                //if(strval(inputtext) == playerid) return SendClientMessage(playerid, -1, "(AVISO) Voc? n?o pode fazer isso com voc? mesmo.");
-                if(Info[strval(inputtext)][pMember] == 3 || Info[strval(inputtext)][pMember] == 6 || Info[strval(inputtext)][pMember] == 7 || Info[strval(inputtext)][pMember] == 1 || Info[strval(inputtext)][pMember] == 8 || Info[strval(inputtext)][pMember] == 9 || Info[strval(inputtext)][pMember] == 10 ||
-                   Info[strval(inputtext)][pMember] == 11) return SendClientMessage(playerid, -1, "(AVISO) O ninja n?o faz parte de sua vila.");
-                if(MissaoKageID[strval(inputtext)] != 0) return SendClientMessage(playerid, -1, "{AB7C4E}(KAGE) Esse ninja j? est? com uma miss?o ativa.");
-                if(ProxDetectorS(2.0, playerid, strval(inputtext)))
-                {
-                    format(string, sizeof(string), "{AB7C4E}O Kage {FFFFFF}%s{AB7C4E} lhe passou a miss?o de ({FFFFFF}ESTOQUE RAMEN{AB7C4E}).", PlayerNameDados(playerid));
-                    SendClientMessage(strval(inputtext), -1, string);
-                    AbriuMissaoKage[strval(inputtext)] = 0; // Reseta a Variavel
-                    KageQuePassouM[strval(inputtext)] = playerid; // Salva o ID do KAGE
-                    MostrarMissoes(strval(inputtext), 5); // MOSTRA A MISS?O
-                }
-            }else{Audio_Play(playerid, 58);}
-        }
-    // === MISS?ES KAGE - KIRIGAKURE
-    if(dialogid == DIALOG_KAGEKIRIMISSAORAMEN)
-    {
-        if(response)
-        {
-            Audio_Play(playerid, 58);
-            if(isNumber(inputtext))
-            if(IsPlayerConnected(strval(inputtext)))
-            if(strval(inputtext) == playerid) return SendClientMessage(playerid, -1, "(AVISO) Voc? n?o pode fazer isso com voc? mesmo.");
-            if(Info[strval(inputtext)][pMember] == 1 || Info[strval(inputtext)][pMember] == 6 || Info[strval(inputtext)][pMember] == 7 || Info[strval(inputtext)][pMember] == 5 || Info[strval(inputtext)][pMember] == 8 || Info[strval(inputtext)][pMember] == 9 || Info[strval(inputtext)][pMember] == 10 ||
-               Info[strval(inputtext)][pMember] == 11) return SendClientMessage(playerid, -1, "(AVISO) O ninja n?o faz parte de sua vila.");
-            if(MissaoKageID[strval(inputtext)] != 0) return SendClientMessage(playerid, -1, "{AB7C4E}(KAGE) Esse ninja j? est? com uma miss?o ativa.");
-            if(ProxDetectorS(2.0, playerid, strval(inputtext)))
-            {
-                format(string, sizeof(string), "{AB7C4E}O Kage {FFFFFF}%s{AB7C4E} lhe passou a miss?o de ({FFFFFF}ESTOQUE RAMEN{AB7C4E}).", PlayerNameDados(playerid));
-                SendClientMessage(strval(inputtext), -1, string);
-                AbriuMissaoKage[strval(inputtext)] = 0; // Reseta a Variavel
-                KageQuePassouM[strval(inputtext)] = playerid; // Salva o ID do KAGE
-                MostrarMissoes(strval(inputtext), 5); // MOSTRA A MISS?O
-            }
-        }else{Audio_Play(playerid, 58);}
-    }
-    // DAR CHEFE MEDICO KIRIGAKURE
+        // === Missoes Kage (Ramen/Ingredientes) movido para Includes/Missoes/shrp_missoes_hooks.inc ===
+    if(Missoes_OnDialogResponse_KageRamen(playerid, dialogid, response, listitem, inputtext)) return 1;
+
+// DAR CHEFE MEDICO KIRIGAKURE
     if(dialogid == DIALOG_DARCHEFEMEDICOKIRI)
     {
         if(response)
@@ -25255,10 +24632,7 @@ public OnDialogResponse(playerid, dialogid, response, listitem, inputtext[])
     }
     if(dialogid == CAMARAS_DIALOGO)
     {
-    /*
-strcat(CAM1,"\tCamara 1.0\t\t\t\t(Unity Station) \n\tCamara 2.0\t\t\t\t(Ayuntamiento INT)\n\tCamara 3.0\t\t\t\t(Juzgados)\n\tCamara 4.0\t\t\t\t(Grotti)\n");
-            strcat(CAM1,"\tCamara 5.0\t\t\t\t(Banco Safe)\n\tCamara 6.0\t\t\t\t(Avenida Principal)\n\tCamara 7.0\t\t\t\t(VineWood)\n\tCamara 8.0\t\t\t\t(Comisaria)");
-    */
+
         if(response == 1)
         {
             switch(listitem)
@@ -32735,6 +32109,7 @@ case DIALOG_VENDAAC:
                     {
                         if(Info[playerid][pRank] >= 1)
                         {
+                            MissoesLegacyUI_Ensure(playerid);
                             new str[64];
                             IdentMissao[playerid] = 1;  // 1 = Missao de Guarda Konoha/Kiri
                             format(str, sizeof(str), "Guarda", str);
@@ -36461,6 +35836,7 @@ case DIALOG_ARMASKUMOG:
                 if(listitem == 3)
                 {
                     Info[playerid][pClan] = 4;
+                    Info[playerid][pClanNivel] = 1; // nivel cla
                     Info[playerid][pOjoDerecho] = 1;
                     Info[playerid][pOjoIzquierdo] = 1;
                     format(stringC, sizeof(stringC), "{FFFFFF}[Shinobi]:{00F70C} Voc? ? do cl? Hyuuga. De qual pa?s voc? ??");
@@ -37060,6 +36436,7 @@ case DIALOG_ARMASKUMOG:
                 {
                     InsideMainMenu[playerid] = false;
                     INI_ParseFile(UserPath(playerid), "LoadUser_data", .bExtra = true, .extra = playerid);
+                    Clan_EnsureDefaults(playerid);
                     //BINDJUTSU salvar
                     new acc[MAX_PLAYER_NAME];
                     GetPlayerName(playerid, acc, sizeof acc); // accountKey = nick (mesma "chave" do .ini)
@@ -37430,6 +36807,8 @@ if(dialogid == DIALOG_ESCOLHERNOME)
                     NameBar(playerid);
                     SistemaBandanaIDStatus(playerid);
                     RemoverItensConta(playerid);
+                    // Sorteia o cla automaticamente na criacao
+					RegChar_ClanRandom(playerid);
                     if(!RegChar_PreCheck(playerid)) return 1;
                     RegChar_AfterNome(playerid);
                     return 1;
@@ -40688,6 +40067,12 @@ CMD:testejutsu3(playerid)
     return 1;
 }
 
+CMD:testejutsu4(playerid)
+{
+    JutsuHakkeshou(playerid);
+    return 1;
+}
+
 // === Bisturi Jutsu
 CMD:mesu(playerid, params[])
 {
@@ -40695,14 +40080,6 @@ CMD:mesu(playerid, params[])
     // if(IsPlayerNPC(playerid)) return 1;
 
     MesuChakra(playerid);
-    return 1;
-}
-
-
-CMD:testejutsu5(playerid)
-{
-
-    SapoInvocacaoJutsu(playerid);
     return 1;
 }
 
@@ -43569,6 +42946,10 @@ function TsutenkykauuDestroyObj(playerid)
 //=== Byakugan
 function ByakuganJutsu(playerid)
 {
+
+    if(Info[playerid][pClan] != CLAN_HYUUGA || Info[playerid][pClanNivel] < 1)
+    return SendClientMessage(playerid, -1, "{FF0000}(ERRO) Voce ainda nao desbloqueou o NIVEL 1 do Cla Hyuuga (Byakugan).");
+
     if(Byakugan[playerid][byakuganTimer] > gettime()) return JutsuNotReady2(playerid, COLOR_WHITE, "Byakugan", Byakugan[playerid][byakuganTimer]);
     Byakugan[playerid][byakuganTimer] = gettime() + BYAKUGAN_COOLDOWN;
     Byakugan[playerid][byakuganUse] = 1;
@@ -43768,6 +43149,10 @@ function CancelarByakugan(playerid)
 // === Byakugan Fun??es Move Camera End === //
 function JutsuHakkeshou(playerid)
 {
+
+    if(Info[playerid][pClan] != CLAN_HYUUGA || Info[playerid][pClanNivel] < 2)
+    return SendClientMessage(playerid, -1, "{FF0000}(ERRO) Voce precisa do NIVEL 2 do Cla Hyuuga para usar Hakkeshou.");
+
     if(Hakkeshou[playerid][hakkeshouTimer] > gettime()) return JutsuNotReady2(playerid, COLOR_WHITE, "Hakkeshou no Jutsu", Hakkeshou[playerid][hakkeshouTimer]);
     Hakkeshou[playerid][hakkeshouTimer] = gettime() + HAKKESHOU_COOLDOWN;
     HyuugaHakkeshouObj(playerid);
@@ -43913,8 +43298,6 @@ function JuuhoEndTimer(playerid)
     return 1;
 }
 //=== Hyuuga End
-//=== Nara
-//=== Nara End
 //=== FUNCTION CLAN JUTSUS END===//
 //=== Iryou
 function IryouJutsu(playerid)
@@ -44864,6 +44247,7 @@ function ReanimarAnimm(playerid, giveplayerid)
         format(string, sizeof(string), "* %s Reanimou %s.", PlayerNameDados(playerid), PlayerNameDados(giveplayerid));
         ProxDetector(30.0, playerid, string, COLOR_PURPLE,COLOR_PURPLE,COLOR_PURPLE,COLOR_PURPLE,COLOR_PURPLE);
     }
+    ProfServ_OnMedicReanimar(playerid, giveplayerid);
     return 1;
 }
 function RenimarCorpo(playerid)
@@ -45359,7 +44743,7 @@ stock IsPlayerHittable(playerid)
     #if defined SHRP_NpcAI_IsCombatNPC
         return IsPlayerHittableEx(playerid, SHRP_NpcAI_IsCombatNPC(playerid));
     #else
-        return IsPlayerHittableEx(playerid, false); // por padrão: NO permite NPC
+        return IsPlayerHittableEx(playerid, false); // por padro: NO permite NPC
     #endif
 }
 
@@ -45613,7 +44997,17 @@ GetLookingTarget(Float:distance, Float:hitbox, bool:condition, bool:players, vir
         {
             new Float:playerPos[3];
             GetPlayerPos(targetid, playerPos[0], playerPos[1], playerPos[2]);
-            if(GetPlayerDistanceFromPoint(playerid, playerPos[0], playerPos[1], playerPos[2]) < distance && !condition && IsPlayerAimingAt(playerid, playerPos[0], playerPos[1], playerPos[2], hitbox) && virtualworld == GetPlayerVirtualWorld(targetid)) return PLAYER;
+
+            // FIX (RapidDash / close-range target lock):
+            // The aim test uses the 3rd-person camera ray.
+            // Testing at the target "feet" often fails at 1-3m because of camera offset/parallax.
+            // So we test a point at the torso height instead.
+            new Float:aimZ = playerPos[2] + 0.95;
+
+            if(GetPlayerDistanceFromPoint(playerid, playerPos[0], playerPos[1], playerPos[2]) < distance
+                && !condition
+                && IsPlayerAimingAt(playerid, playerPos[0], playerPos[1], aimZ, hitbox)
+                && virtualworld == GetPlayerVirtualWorld(targetid)) return PLAYER;
         }
     }
     return NONE;
@@ -47875,6 +47269,7 @@ CMD:falarshizune(playerid)
     {
         if(Info[playerid][pRank] >= 1)
         {
+                            MissoesLegacyUI_Ensure(playerid);
             if(EmMissao[playerid] == 0)
             {
                 if(Info[playerid][pMember] == 1)
@@ -48660,6 +48055,9 @@ CMD:assistir(playerid, params[])
 //***ayuda por textdraw***
 public OnPlayerClickTextDraw(playerid, Text:clickedid)
 {
+
+	if(AcaM1_OnPlayerClickTextDraw(playerid, clickedid)) return 1;
+
     if(clickedid == INVALID_TEXT_DRAW && InventoryOpen[playerid] == 1){
         AbrirInventario(playerid, 0);
     }
@@ -48685,6 +48083,7 @@ public OnPlayerClickTextDraw(playerid, Text:clickedid)
         PlayerTextDrawHide(playerid, MissoesNew[playerid][6]);
         PlayerTextDrawHide(playerid, MissoesNew[playerid][7]);
         CancelSelectTextDraw(playerid);
+        BarrasNarutoOn(playerid);
         Audio_Play(playerid, 58);
     }
     if(clickedid == INVALID_TEXT_DRAW && LendoCarta[playerid] == 1){
@@ -50612,9 +50011,12 @@ stock StopRefueling(playerid)
 
 function SetPlayerJoinCamera(playerid) //Camara de Logeo.
 {
-SetPosEx(playerid, 13.12, -539.42, 637.55, 0, 0, 0);
-InterpolateCameraPos(playerid, -19.67, -547.17, 657.94, -69.33, -550.53, 657.94, 15000, CAMERA_MOVE);
-InterpolateCameraLookAt(playerid, -13.08, -607.34, 660.14, -38.82, -609.01, 660.14, 15000, CAMERA_MOVE);
+//SetPosEx(playerid, 13.12, -539.42, 637.55, 0, 0, 0);
+SetPosEx(playerid, 2799.721435, -3457.725585, 9.748814, 0, 0, 0);
+InterpolateCameraPos(playerid, 2811.26, -3452.54, 22.58, 2833.28, -3421.60, 6.39, 15000, CAMERA_MOVE);
+InterpolateCameraLookAt(playerid, 2831.91, -3419.64, -8.89, 2837.39, -3377.99, -17.71, 15000, CAMERA_MOVE);
+//InterpolateCameraPos(playerid, -19.67, -547.17, 657.94, -69.33, -550.53, 657.94, 15000, CAMERA_MOVE);
+//InterpolateCameraLookAt(playerid, -13.08, -607.34, 660.14, -38.82, -609.01, 660.14, 15000, CAMERA_MOVE);
 }
 
 stock IsPlayerInVehicleRadio(playerid, Float:radius)
@@ -54681,278 +54083,27 @@ public OnPlayerGiveDamage(playerid, damagedid, Float:amount, weaponid)
 
 public OnPlayerClickPlayerTextDraw(playerid, PlayerText:playertextid)
 {
+
+	new str[2048]; // buffer para format() e dialogs dentro deste callback
+
+	//missoes
+     if(AcaM1_OnPlayerClickPlayerTextDraw(playerid, playertextid)) return 1;
+     	if(Daily_OnClickPTD(playerid, playertextid)) return 1;
+
+
     //Click do Inventario
     if(InventarioRouboAberto[playerid] == 1){AoClicarNoItemRoubo(playerid, PlayerText:playertextid); return 1;}
     AoClicarNoItem(playerid, PlayerText:playertextid);
     AoClciarNoInventario(playerid, PlayerText:playertextid);
-    AoClicarNaMissoes(playerid, PlayerText:playertextid);
+    if(AoClicarNaMissoes(playerid, PlayerText:playertextid)) return 1;
     AoClicarNoStatsUp(playerid, PlayerText:playertextid);
     AoClicarBotaoProva(playerid, PlayerText:playertextid);
     //Clique do Livro
     AoClicarNoLivro(playerid, PlayerText:playertextid);
     //Final Click do Inventario
     AoClciarNoEscolherVila(playerid, PlayerText:playertextid);
-    //=== Inicio Sistema de Miss?o Vila/Kage ===//
-    new str[500];
-    new pName[MAX_PLAYER_NAME];
-    GetPlayerName(playerid, pName, sizeof(pName));
-    if(playertextid == MissoesVilaTXD[playerid][5]) // Pegar Miss?o
-    {
-        //Missoes de Kage
-        if(AceitarRecusarMissaoKage[playerid] == 1) // Miss?o Ingredientes Kage
-        {
-            if(Info[playerid][pMember] == 1) // Konoha
-            {
-                if(EmMissao[playerid] == 1) return SendClientMessage(playerid, COLOR_WHITE, "[AVISO]: Voc? j? est? em uma miss?o.");
-                Audio_Play(playerid, 58);
-                InMissaoKage[playerid] = 1;
-                AceitarRecusarMissaoKage[playerid] = 0;
-                TogglePlayerControllable(playerid, 1);
-                CancelSelectTextDraw(playerid);
-                PlayerTextDrawShow(playerid, PlayerText:MiraHUD[playerid][0]); // Mira
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][0]); // Background Missao Pegar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][1]); // Nome da Miss?o
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][2]); // Descri??o da Miss?o
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][3]); // Background BotaoP
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][4]); // Background BotaoPP
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][5]); // Botao Pegar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][6]); // Botao Recusar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][7]); // Ryos
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][8]); // XP
-                format(str, sizeof(str), "{5FDE35}(AVISO){FFFFFF} O jogador {E9FE23}%s{FFFFFF} aceitou a miss?o {E9FE23}Ingredientes{FFFFFF}.", PlayerNameDados(playerid));
-                AvisoEntregaKage(COLOR_COMBINEDCHAT, str);
-                //Inicio Do CheckPoint
-                KonohaCPIng[playerid] = SetPlayerCheckpoint(playerid, 272.4548, 1241.3326, 3.4160, 10.0);
-            }
-        }
-        else if(AceitarRecusarMissaoKage[playerid] == 4) // Miss?o Ingredientes Kage
-        {
-            if(Info[playerid][pMember] == 3) // Kiri
-            {
-                if(EmMissao[playerid] == 1) return SendClientMessage(playerid, COLOR_WHITE, "[AVISO]: Voc? j? est? em uma miss?o.");
-                Audio_Play(playerid, 58);
-                InMissaoKage[playerid] = 1;
-                AceitarRecusarMissaoKage[playerid] = 0;
-                TogglePlayerControllable(playerid, 1);
-                CancelSelectTextDraw(playerid);
-                PlayerTextDrawShow(playerid, PlayerText:MiraHUD[playerid][0]); // Mira
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][0]); // Background Missao Pegar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][1]); // Nome da Miss?o
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][2]); // Descri??o da Miss?o
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][3]); // Background BotaoP
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][4]); // Background BotaoPP
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][5]); // Botao Pegar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][6]); // Botao Recusar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][7]); // Ryos
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][8]); // XP
-                format(str, sizeof(str), "{5FDE35}(AVISO){FFFFFF} O jogador {E9FE23}%s{FFFFFF} aceitou a miss?o {E9FE23}Ingredientes{FFFFFF}.", PlayerNameDados(playerid));
-                AvisoEntregaKage2(COLOR_COMBINEDCHAT, str);
-                //Inicio Do CheckPoint
-                KonohaCPIng[playerid] = SetPlayerCheckpoint(playerid, 1404.9886, -1512.7532, 7.9219, 10.0);
-            }
-        }
-        else if(AceitarRecusarMissaoKage[playerid] == 3) // Miss?o Ingredientes Kage
-        {
-            if(Info[playerid][pMember] == 1) // Konoha
-            {
-                if(EmMissao[playerid] == 1) return SendClientMessage(playerid, COLOR_WHITE, "[AVISO]: Voc? j? est? em uma miss?o.");
-                Audio_Play(playerid, 58);
-                InMissaoKage[playerid] = 1;
-                AceitarRecusarMissaoKage[playerid] = 0;
-                TogglePlayerControllable(playerid, 1);
-                CancelSelectTextDraw(playerid);
-                PlayerTextDrawShow(playerid, PlayerText:MiraHUD[playerid][0]); // Mira
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][0]); // Background Missao Pegar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][1]); // Nome da Miss?o
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][2]); // Descri??o da Miss?o
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][3]); // Background BotaoP
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][4]); // Background BotaoPP
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][5]); // Botao Pegar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][6]); // Botao Recusar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][7]); // Ryos
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][8]); // XP
-                format(str, sizeof(str), "{5FDE35}(AVISO){FFFFFF} O jogador {E9FE23}%s{FFFFFF} aceitou a miss?o {E9FE23}Medicamentos{FFFFFF}.", PlayerNameDados(playerid));
-                AvisoEntregaKage(COLOR_COMBINEDCHAT, str);
-                //Inicio Do CheckPoint
-                KonohaCPIng[playerid] = SetPlayerCheckpoint(playerid, 79.5390, 1327.8228, 24.1027, 10.0);
-            }
-        }
-        else if(AceitarRecusarMissaoKage[playerid] == 6) // Miss?o Ingredientes Kage
-        {
-            if(Info[playerid][pMember] == 3) // Kiri
-            {
-                if(EmMissao[playerid] == 1) return SendClientMessage(playerid, COLOR_WHITE, "[AVISO]: Voc? j? est? em uma miss?o.");
-                Audio_Play(playerid, 58);
-                InMissaoKage[playerid] = 1;
-                AceitarRecusarMissaoKage[playerid] = 0;
-                TogglePlayerControllable(playerid, 1);
-                CancelSelectTextDraw(playerid);
-                PlayerTextDrawShow(playerid, PlayerText:MiraHUD[playerid][0]); // Mira
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][0]); // Background Missao Pegar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][1]); // Nome da Miss?o
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][2]); // Descri??o da Miss?o
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][3]); // Background BotaoP
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][4]); // Background BotaoPP
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][5]); // Botao Pegar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][6]); // Botao Recusar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][7]); // Ryos
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][8]); // XP
-                format(str, sizeof(str), "{5FDE35}(AVISO){FFFFFF} O jogador {E9FE23}%s{FFFFFF} aceitou a miss?o {E9FE23}Medicamentos{FFFFFF}.", PlayerNameDados(playerid));
-                AvisoEntregaKage2(COLOR_COMBINEDCHAT, str);
-                //Inicio Do CheckPoint
-                KonohaCPIng[playerid] = SetPlayerCheckpoint(playerid, 79.5390, 1327.8228, 24.1027, 10.0);
-            }
-        }
-        else if(IdentMissao[playerid] == 1) // Missao de Guarda
-        {
-            if(Info[playerid][pMember] == 1)
-            {
-                if(InMissaoKage[playerid] == 1) return SendClientMessage(playerid, COLOR_WHITE, "[AVISO]: Voc? j? est? em uma miss?o.");
-                Audio_Play(playerid, 58);
-                EmMissao[playerid] = 1;
-                TogglePlayerControllable(playerid, 1);
-                CancelSelectTextDraw(playerid);
-                PlayerTextDrawShow(playerid, PlayerText:MiraHUD[playerid][0]); // Mira
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][0]); // Background Missao Pegar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][1]); // Nome da Miss?o
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][2]); // Descri??o da Miss?o
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][3]); // Background BotaoP
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][4]); // Background BotaoPP
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][5]); // Botao Pegar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][6]); // Botao Recusar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][7]); // Ryos
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][8]); // XP
-                //Inicio Do CheckPoint
-                GuardaKonohaCP[playerid] = SetPlayerCheckpoint(playerid, 55.0114, -882.9900, 8.1666, 2.0);
-            }
-            if(Info[playerid][pMember] == 3)
-            {
-                if(InMissaoKage[playerid] == 1) return SendClientMessage(playerid, COLOR_WHITE, "[AVISO]: Voc? j? est? em uma miss?o.");
-                Audio_Play(playerid, 58);
-                EmMissao[playerid] = 1;
-                TogglePlayerControllable(playerid, 1);
-                CancelSelectTextDraw(playerid);
-                PlayerTextDrawShow(playerid, PlayerText:MiraHUD[playerid][0]); // Mira
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][0]); // Background Missao Pegar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][1]); // Nome da Miss?o
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][2]); // Descri??o da Miss?o
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][3]); // Background BotaoP
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][4]); // Background BotaoPP
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][5]); // Botao Pegar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][6]); // Botao Recusar
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][7]); // Ryos
-                PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][8]); // XP
-                //Inicio Do CheckPoint
-                GuardaKiriCP[playerid] = SetPlayerCheckpoint(playerid, 2194.1113, -2314.5515, 30.1967, 2.0);
-            }
-        }
-    }
-    if(playertextid == MissoesVilaTXD[playerid][6]) // Recusar Miss?o
-    {
-        if(AceitarRecusarMissaoKage[playerid] == 1) // Miss?o Ingredientes Kage
-        {
-            Audio_Play(playerid, 58);
-            InMissaoKage[playerid] = 0;
-            IdentMissaoKage[playerid] = 0;
-            AceitarRecusarMissaoKage[playerid] = 0;
-            TogglePlayerControllable(playerid, 1);
-            CancelSelectTextDraw(playerid);
-            PlayerTextDrawShow(playerid, PlayerText:MiraHUD[playerid][0]); // Mira
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][0]); // Background Missao Pegar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][1]); // Nome da Miss?o
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][2]); // Descri??o da Miss?o
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][3]); // Background BotaoP
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][4]); // Background BotaoPP
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][5]); // Botao Pegar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][6]); // Botao Recusar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][7]); // Ryos
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][8]); // XP
-            format(str, sizeof(str), "{5FDE35}(AVISO){FFFFFF} O jogador {E9FE23}%s{FFFFFF} recusou a miss?o {E9FE23}Ingredientes{FFFFFF}.", PlayerNameDados(playerid));
-            AvisoEntregaKage(COLOR_COMBINEDCHAT, str);
-        }
-        else if(AceitarRecusarMissaoKage[playerid] == 4) // Miss?o Ingredientes Kage
-        {
-            Audio_Play(playerid, 58);
-            InMissaoKage[playerid] = 0;
-            IdentMissaoKage[playerid] = 0;
-            AceitarRecusarMissaoKage[playerid] = 0;
-            TogglePlayerControllable(playerid, 1);
-            CancelSelectTextDraw(playerid);
-            PlayerTextDrawShow(playerid, PlayerText:MiraHUD[playerid][0]); // Mira
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][0]); // Background Missao Pegar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][1]); // Nome da Miss?o
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][2]); // Descri??o da Miss?o
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][3]); // Background BotaoP
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][4]); // Background BotaoPP
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][5]); // Botao Pegar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][6]); // Botao Recusar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][7]); // Ryos
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][8]); // XP
-            format(str, sizeof(str), "{5FDE35}(AVISO){FFFFFF} O jogador {E9FE23}%s{FFFFFF} recusou a miss?o {E9FE23}Ingredientes{FFFFFF}.", PlayerNameDados(playerid));
-            AvisoEntregaKage2(COLOR_COMBINEDCHAT, str);
-        }
-        else if(AceitarRecusarMissaoKage[playerid] == 3) // Miss?o Medicamentos Kage
-        {
-            Audio_Play(playerid, 58);
-            InMissaoKage[playerid] = 0;
-            IdentMissaoKage[playerid] = 0;
-            AceitarRecusarMissaoKage[playerid] = 0;
-            TogglePlayerControllable(playerid, 1);
-            CancelSelectTextDraw(playerid);
-            PlayerTextDrawShow(playerid, PlayerText:MiraHUD[playerid][0]); // Mira
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][0]); // Background Missao Pegar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][1]); // Nome da Miss?o
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][2]); // Descri??o da Miss?o
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][3]); // Background BotaoP
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][4]); // Background BotaoPP
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][5]); // Botao Pegar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][6]); // Botao Recusar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][7]); // Ryos
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][8]); // XP
-            format(str, sizeof(str), "{5FDE35}(AVISO){FFFFFF} O jogador {E9FE23}%s{FFFFFF} recusou a miss?o {E9FE23}Medicamentos{FFFFFF}.", PlayerNameDados(playerid));
-            AvisoEntregaKage(COLOR_COMBINEDCHAT, str);
-        }
-        else if(AceitarRecusarMissaoKage[playerid] == 6) // Miss?o Medicamentos Kage
-        {
-            Audio_Play(playerid, 58);
-            InMissaoKage[playerid] = 0;
-            IdentMissaoKage[playerid] = 0;
-            AceitarRecusarMissaoKage[playerid] = 0;
-            TogglePlayerControllable(playerid, 1);
-            CancelSelectTextDraw(playerid);
-            PlayerTextDrawShow(playerid, PlayerText:MiraHUD[playerid][0]); // Mira
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][0]); // Background Missao Pegar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][1]); // Nome da Miss?o
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][2]); // Descri??o da Miss?o
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][3]); // Background BotaoP
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][4]); // Background BotaoPP
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][5]); // Botao Pegar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][6]); // Botao Recusar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][7]); // Ryos
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][8]); // XP
-            format(str, sizeof(str), "{5FDE35}(AVISO){FFFFFF} O jogador {E9FE23}%s{FFFFFF} recusou a miss?o {E9FE23}Medicamentos{FFFFFF}.", PlayerNameDados(playerid));
-            AvisoEntregaKage2(COLOR_COMBINEDCHAT, str);
-        }
-        else if(IdentMissao[playerid] == 1) // Missao de Guarda
-        {
-            Audio_Play(playerid, 58);
-            EmMissao[playerid] = 0;
-            IdentMissao[playerid] = 0;
-            TogglePlayerControllable(playerid, 1);
-            CancelSelectTextDraw(playerid);
-            PlayerTextDrawShow(playerid, PlayerText:MiraHUD[playerid][0]); // Mira
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][0]); // Background Missao Pegar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][1]); // Nome da Miss?o
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][2]); // Descri??o da Miss?o
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][3]); // Background BotaoP
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][4]); // Background BotaoPP
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][5]); // Botao Pegar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][6]); // Botao Recusar
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][7]); // Ryos
-            PlayerTextDrawHide(playerid, MissoesVilaTXD[playerid][8]); // XP
-        }
-    }
-    //=== Final Sistema de Miss?o Vila/Kage ===//
+        //=== Sistema de Missao Vila/Kage (movido para Includes/Missoes/shrp_missoes_hooks.inc) ===//
+    if(Missoes_OnPlayerClickPlayerTextDraw_VilaKage(playerid, playertextid)) return 1;
     //Inicio Sistema Login/Registro
     if(playertextid == TXDLogin[playerid][1])
     {
@@ -54995,8 +54146,8 @@ public OnPlayerClickPlayerTextDraw(playerid, PlayerText:playertextid)
     if(playertextid == PlayerCriacaoPerso[playerid][10])// Bot?o Escolher Sexo
     {
         Audio_Play(playerid, 58);
-        format(str, sizeof(str), "{AB7C4E}(SL) Voc? precisa escolher um sexo antes.");
-        if(SexoEscolhido[playerid] == 0) return SendClientMessage(playerid, -1, str);
+        if(SexoEscolhido[playerid] == 0)
+   		return SendClientMessage(playerid, -1, "{AB7C4E}(SL) Voc? precisa escolher um sexo antes.");
         if(SexoEscolhido[playerid] == 1){ // Masculino
             Info[playerid][pSex] = 1;
             Skin(playerid, 1);
@@ -55334,6 +54485,8 @@ function RemoverEscolha(playerid)
 }
 public OnPlayerTakeDamage(playerid, issuerid, Float: amount, weaponid)
 {
+
+
     SetPlayerHealth(playerid, 100);
     // Notifica o AI de NPCs (guards/clones) para retaliar quando o dono toma dano
     #if defined SHRP_NpcAI_OnPlayerDamaged
@@ -55383,6 +54536,9 @@ stock BajarVida(playerid,Float:vida)
 }
 public OnPlayerGiveDamageActor(playerid, damaged_actorid, Float: amount, weaponid, bodypart)
 {
+
+    Daily_OnGiveDmgAct(playerid, damaged_actorid, amount, weaponid, bodypart);
+
     return 1;
 }
 
@@ -57347,6 +56503,7 @@ function KonohaCP2(playerid)
     }
     if(GuardaKonohaNM[playerid] == 8)
     {
+        MissoesLegacyUI_Ensure(playerid);
         format(str, sizeof(str), "88", str); // Ryos da Miss?o
         PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][8], str);
         format(str, sizeof(str), "152", str); // XP da Miss?o
@@ -57404,6 +56561,7 @@ function KiriCP2(playerid)
     }
     if(GuardaKiriNM[playerid] == 8)
     {
+        MissoesLegacyUI_Ensure(playerid);
         format(str, sizeof(str), "88", str); // Ryos da Miss?o
         PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][8], str);
         format(str, sizeof(str), "152", str); // XP da Miss?o
@@ -57422,6 +56580,7 @@ function KiriCP2(playerid)
 }
 function GuardaCompleta(playerid)
 {
+    MissoesLegacyUI_Ensure(playerid);
     Audio_Play(playerid, 59);
     PlayerTextDrawShow(playerid, FinalizarMissao[playerid][0]); // SUCESSO
     PlayerTextDrawShow(playerid, FinalizarMissao[playerid][1]); // BACKGROUND MISSAO COMPLETA
@@ -63693,7 +62852,7 @@ HitPlayer(playerid, victimid, hit, bool:protected)
         if(IsPlayerNPC(victimid) && CallLocalFunction("SHRP_NpcAI_IsOwnedBy", "ii", victimid, playerid) == 1) return 0;
         if(IsPlayerNPC(playerid) && CallLocalFunction("SHRP_NpcAI_IsOwnedBy", "ii", playerid, victimid) == 1) return 0;
     }
-    
+
     // Clone x Clone: se os dois NPCs forem do MESMO dono, bloqueia o hit (evita friendly-fire)
 	if(funcidx("SHRP_NpcAI_SameOwner") != -1)
 	{
@@ -63721,6 +62880,10 @@ HitPlayer(playerid, victimid, hit, bool:protected)
         TimerDefesaHit[playerid] = gettime() + DEFESAHIT_BACK; DefesaH[victimid][defesaHit]++;
         return 1;
     }
+
+    // Quebra-Combo: conta hits tomados em sequncia (situao 2)
+    QC_RegisterHit(playerid, victimid);
+
     HitCountCombos(playerid);
     EmCombateIniciar(playerid);
     Status[playerid] = 8;
@@ -64229,19 +63392,19 @@ TaijutsuAirHyuuga(playerid, hit)
     {
         switch(hit)
         {
-            case 1: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_A1x", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 90);}
-            case 2: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_A2x", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 90);}
-            case 3: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_A1x", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 90);}
-            case 4: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_A2x", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 90);}
+            case 1: {ApplyAnimation(playerid, "Base01", "Hy01_Ar_cmb01", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 90);}
+            case 2: {ApplyAnimation(playerid, "Base01", "Hy01_Ar_cmb02", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 90);}
+            case 3: {ApplyAnimation(playerid, "Base01", "Hy01_Ar_cmb03", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 90);}
+            case 4: {ApplyAnimation(playerid, "Base01", "Hy01_Ar_cmb04", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 90);}
         }
     }else if(Byakugan[playerid][byakuganUse] == 0)
     {
         switch(hit)
         {
-            case 1: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_A1x", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 120);}
-            case 2: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_A2x", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 120);}
-            case 3: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_A1x", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 120);}
-            case 4: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_A2x", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 120);}
+            case 1: {ApplyAnimation(playerid, "Base01", "Hy01_Ar_cmb01", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 120);}
+            case 2: {ApplyAnimation(playerid, "Base01", "Hy01_Ar_cmb02", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 120);}
+            case 3: {ApplyAnimation(playerid, "Base01", "Hy01_Ar_cmb03", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 120);}
+            case 4: {ApplyAnimation(playerid, "Base01", "Hy01_Ar_cmb04", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 120);}
         }
     }
 }
@@ -64251,19 +63414,22 @@ TaijutsuMeleeHyuuga(playerid, hit)
     {
         switch(hit)
         {
-            case 1: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_H1x", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 150);}
-            case 2: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_H2x", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 150);}
-            case 3: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_H1x", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 150);}
-            case 4: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_H3x", 3.0, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 150);}
+            case 1: {ApplyAnimation(playerid, "Base01", "Hy02_cmb01", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 150);}
+            case 2: {ApplyAnimation(playerid, "Base01", "Hy02_cmb02", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 150);}
+            case 3: {ApplyAnimation(playerid, "Base01", "Hy02_cmb03", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 150);}
+            case 4: {ApplyAnimation(playerid, "Base01", "Hy02_cmb04", 3.0, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 150);}
+            case 5: {ApplyAnimation(playerid, "Base01", "Hy02_cmb05", 3.0, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 150);}
+            case 6: {ApplyAnimation(playerid, "Base01", "Hy02_cmb06", 3.0, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 150);}
+            case 7: {ApplyAnimation(playerid, "Base01", "Hy02_cmb07", 3.0, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 150);}
         }
     }else if(Byakugan[playerid][byakuganUse] == 0)
     {
         switch(hit)
         {
-            case 1: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_H1x", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 200);}
-            case 2: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_H2x", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 200);}
-            case 3: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_H1x", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 200);}
-            case 4: {ApplyAnimation(playerid, "Combo_1", "Hyuuga_H3x", 3.0, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 200);}
+            case 1: {ApplyAnimation(playerid, "Base01", "Hy02_cmb01", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 200);}
+            case 2: {ApplyAnimation(playerid, "Base01", "Hy02_cmb02", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 200);}
+            case 3: {ApplyAnimation(playerid, "Base01", "Hy02_cmb03", 3.5, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 200);}
+            case 4: {ApplyAnimation(playerid, "Base01", "Hy02_cmb04", 3.0, 0, 1, 1, 0, 0, 1); _CanHitAgain(playerid, 200);}
         }
     }
 }
@@ -64928,6 +64094,17 @@ GunbaiFMadaraAir(playerid, hit)
 //Defesa
 EmDefesa(playerid, newkeys, oldkeys)
 {
+    // Quebra-Combo (DEFENSA): tenta disparar ANTES dos bloqueios de defesa durante hit
+    // (somente quando o player realmente APERTOU DEFESA agora)
+    if(!DefesaH[playerid][defesaTimer] && PRESSED (KEY_SPRINT | KEY_AIM) && oldkeys != KEY_AIM)
+    {
+        if(QC_TryTrigger(playerid)) return 1;
+    }
+    else if(!DefesaH[playerid][defesaTimer] && PRESSED ( KEY_AIM | KEY_SPRINT) && oldkeys != KEY_SPRINT)
+    {
+        if(QC_TryTrigger(playerid)) return 1;
+    }
+
     if(Examinando[playerid] == 1){PararDeExaminar(playerid); return 1;}
     if(IryouUse[playerid] == 1){PararDeCurar(playerid); return 1;}
     if(CarregandoChakra[playerid] == 1){PCarregandoChakra(playerid); return 1;}
@@ -64938,6 +64115,10 @@ EmDefesa(playerid, newkeys, oldkeys)
     if(GetPVarInt(playerid, "Inconsciente") >= 1 || KagutsuchiON[playerid] == 1 || IkazuchiHitAlvo[playerid] == 1 || SeladoS[playerid] == 1 || ChidoriON[playerid] == 2 || SuirouON[playerid] == 1 || PlayerParalisado[playerid] == 1 || SetPlayerState[playerid] == 1 || ChuteCimaHitted[playerid] == 1 || SuirouHIT[playerid] == 1) return 0;
     if(!DefesaH[playerid][defesaTimer] && PRESSED (KEY_SPRINT | KEY_AIM) && oldkeys != KEY_AIM)
     {
+        // [QC] Enquanto estiver apanhando (sequencia ativa), DEFESA normal fica BLOQUEADA.
+        // Somente o Quebra-Combo (QC_TryTrigger) pode quebrar (apos 3 hits).
+        if(QC_LastHitTick[playerid] && (GetTickCount() - QC_LastHitTick[playerid]) <= QUEBRACOMBO_CHAIN_MS) return 0;
+
         SetPlayerFacingAngleToCamera(playerid);
         AudioInPlayer(playerid, 20.0, 87);
         SetPVarInt(playerid, "Defensa", 1);
@@ -64950,6 +64131,10 @@ EmDefesa(playerid, newkeys, oldkeys)
     }
     else if(!DefesaH[playerid][defesaTimer] && PRESSED ( KEY_AIM | KEY_SPRINT) && oldkeys != KEY_SPRINT)
     {
+        // [QC] Enquanto estiver apanhando (sequencia ativa), DEFESA normal fica BLOQUEADA.
+        // Somente o Quebra-Combo (QC_TryTrigger) pode quebrar (apos 3 hits).
+        if(QC_LastHitTick[playerid] && (GetTickCount() - QC_LastHitTick[playerid]) <= QUEBRACOMBO_CHAIN_MS) return 0;
+
         SetPlayerFacingAngleToCamera(playerid);
         AudioInPlayer(playerid, 20.0, 87);
         SetPVarInt(playerid, "Defensa", 1);
@@ -65949,6 +65134,7 @@ function VerificarPonto(playerid)
             skin = GetPlayerSkinEx(playerid);
             SkinPontoDP[playerid] = skin;
             PontoBatidoDP[playerid] = 1;
+        ProfServ_OnDutyToggle(playerid, PROF_DP, true);
             GetPlayerPatente(playerid);
             Info[playerid][pMaskuse] = 1;
             QuantidadePolicialIwaga++;
@@ -65965,6 +65151,7 @@ function VerificarPonto(playerid)
     {
         if(Info[playerid][pMember] == 1){ // Iwagakure
             PontoBatidoDP[playerid] = 0;
+        ProfServ_OnDutyToggle(playerid, PROF_DP, false);
             Info[playerid][pMaskuse] = 0;
             SetPlayerSkin(playerid, SkinPontoDP[playerid]);
             QuantidadePolicialIwaga--;
@@ -66077,6 +65264,7 @@ stock SistemaDeProgressoDP(playerid)
     new policial = Info[playerid][pDPPatente], progresso = Info[playerid][pProgressoDP];
     if(progresso >= 6000) SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Voc? n?o consegue mais treinar seu {FFFFFF}Ninjutsu Policial{AB7C4E}.");
     if(PontoBatidoDP[playerid] == 0) return 0;
+    if(!ProfServ_IsSalaryActive(playerid, PROF_DP)) return 0;
     if(policial == 1 || policial == 7) return 0;
     //Maximos Iwagakure
     if(policial == 2 && progresso == 300) return SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Voc? n?o consegue mais treinar seu {FFFFFF}Ninjutsu Policial{AB7C4E}.");
@@ -66627,6 +65815,7 @@ function VerificarPontoHP(playerid)
     if(PontoBatidoHP[playerid] == 0)
     {
         PontoBatidoHP[playerid] = 1;
+        ProfServ_OnDutyToggle(playerid, PROF_HP, true);
         switch(Info[playerid][pHPPatente])
         {
             case 0: return 0;
@@ -66656,6 +65845,7 @@ function VerificarPontoHP(playerid)
     {
         Editing[playerid] = 0;
         PontoBatidoHP[playerid] = 0;
+        ProfServ_OnDutyToggle(playerid, PROF_HP, false);
         EditandoPontoHP[playerid] = 0;
         RemovePlayerAttachedObject(playerid, 1);
         if(Info[playerid][pMember] == 1){QuantidadeMedicoIwaga--;} // Iwagakure
@@ -66668,6 +65858,7 @@ stock SistemaDeProgressoHP(playerid)
     new medico = Info[playerid][pHPPatente], progresso = Info[playerid][pProgressoHP];
     if(progresso == 6000) return SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Voc? n?o consegue mais treinar seu {FFFFFF}Ninjutsu Medico{AB7C4E}.");
     if(PontoBatidoHP[playerid] == 0) return 0;
+    if(!ProfServ_IsSalaryActive(playerid, PROF_HP)) return 0;
     if(medico == 1 || medico == 6) return 0;
     //Iwagakure Maximos
     if(medico == 2 && progresso == 600) return SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Voc? n?o consegue mais treinar seu {FFFFFF}Ninjutsu Medico{AB7C4E}.");
@@ -66799,6 +65990,17 @@ TeclaJumpNinja(playerid, newkeys, oldkeys)
 {
     if(IsPlayerNPC(playerid)) return 0; // NPC nao usa esse sistema de pulo (evita crash/bugs)
     if(Info[playerid][pEnergiaEmUso] <= 0.0) return 0;
+
+
+    // ======================================================
+    // [QC] STUN DO COMBO: enquanto estiver TOMANDO HITS em sequncia,
+    // NO pode pular (nem Jump Ninja), para no escapar "pulando".
+    //
+    // Sadas previstas:
+    //  - Quebra-Combo (DEFESA) quando liberar aps 3 hits (QC)
+    //  - Jutsu de escape (ex: Sharingan/Kawarimi/Izanagi) -> chame QC_ResetChain(playerid)
+    // ======================================================
+    if(QC_IsChainActive(playerid)) return 0;
 
     // Verifica?s de bloqueio de a?
     if(Info[playerid][pNinjaQuebrado] == 1 || Info[playerid][pNinjaQuebrado] == 3){
@@ -67509,6 +66711,92 @@ CMD:savepos(playerid)
     SendClientMessage(playerid, -1, str);
     return 1;
 }
+// ======================================================
+// Debug Camera: capturar coords no jogo pra cinematic
+// /cam1, /cam2, /camprint [tempo_ms]
+// ======================================================
+static stock Cam_Capture(playerid, const keyPrefix[])
+{
+    new Float:cx, Float:cy, Float:cz;
+    new Float:fx, Float:fy, Float:fz;
+
+    GetPlayerCameraPos(playerid, cx, cy, cz);
+    GetPlayerCameraFrontVector(playerid, fx, fy, fz);
+
+    // Distancia do lookAt (ajuste se quiser: 30.0 / 50.0 / 80.0)
+    new Float:dist = 50.0;
+
+    new Float:lx = cx + (fx * dist);
+    new Float:ly = cy + (fy * dist);
+    new Float:lz = cz + (fz * dist);
+
+    new kx[24], ky[24], kz[24], klx[24], kly[24], klz[24], kh[24];
+    format(kx,  sizeof kx,  "%sx",  keyPrefix);
+    format(ky,  sizeof ky,  "%sy",  keyPrefix);
+    format(kz,  sizeof kz,  "%sz",  keyPrefix);
+    format(klx, sizeof klx, "%slx", keyPrefix);
+    format(kly, sizeof kly, "%sly", keyPrefix);
+    format(klz, sizeof klz, "%slz", keyPrefix);
+    format(kh,  sizeof kh,  "%shas", keyPrefix);
+
+    SetPVarFloat(playerid, kx,  cx);
+    SetPVarFloat(playerid, ky,  cy);
+    SetPVarFloat(playerid, kz,  cz);
+    SetPVarFloat(playerid, klx, lx);
+    SetPVarFloat(playerid, kly, ly);
+    SetPVarFloat(playerid, klz, lz);
+    SetPVarInt(playerid, kh, 1);
+    return 1;
+}
+
+CMD:cam1(playerid, params[])
+{
+    if(Info[playerid][pAdminZC] == 0) return SendClientMessage(playerid, 0xFF0000AA, "[ERRO]: Este comando nao existe!");
+    Cam_Capture(playerid, "cam1_");
+    SendClientMessage(playerid, -1, "{AB7C4E}(CAM) Ponto 1 gravado. Use /cam2 e depois /camprint.");
+    return 1;
+}
+
+CMD:cam2(playerid, params[])
+{
+    if(Info[playerid][pAdminZC] == 0) return SendClientMessage(playerid, 0xFF0000AA, "[ERRO]: Este comando nao existe!");
+    Cam_Capture(playerid, "cam2_");
+    SendClientMessage(playerid, -1, "{AB7C4E}(CAM) Ponto 2 gravado. Use /camprint.");
+    return 1;
+}
+
+CMD:camprint(playerid, params[])
+{
+    if(Info[playerid][pAdminZC] == 0) return SendClientMessage(playerid, 0xFF0000AA, "[ERRO]: Este comando nao existe!");
+
+    if(GetPVarInt(playerid, "cam1_has") != 1 || GetPVarInt(playerid, "cam2_has") != 1)
+        return SendClientMessage(playerid, -1, "{AB7C4E}(CAM) Grave primeiro com /cam1 e /cam2.");
+
+    new timeMs = 15000;
+    if(!isnull(params)) timeMs = strval(params);
+    if(timeMs < 500) timeMs = 500;
+
+    new Float:sx = GetPVarFloat(playerid, "cam1_x");
+    new Float:sy = GetPVarFloat(playerid, "cam1_y");
+    new Float:sz = GetPVarFloat(playerid, "cam1_z");
+    new Float:slx = GetPVarFloat(playerid, "cam1_lx");
+    new Float:sly = GetPVarFloat(playerid, "cam1_ly");
+    new Float:slz = GetPVarFloat(playerid, "cam1_lz");
+
+    new Float:ex = GetPVarFloat(playerid, "cam2_x");
+    new Float:ey = GetPVarFloat(playerid, "cam2_y");
+    new Float:ez = GetPVarFloat(playerid, "cam2_z");
+    new Float:elx = GetPVarFloat(playerid, "cam2_lx");
+    new Float:ely = GetPVarFloat(playerid, "cam2_ly");
+    new Float:elz = GetPVarFloat(playerid, "cam2_lz");
+
+    printf("[CAM] InterpolateCameraPos(playerid, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %d, CAMERA_MOVE);", sx, sy, sz, ex, ey, ez, timeMs);
+    printf("[CAM] InterpolateCameraLookAt(playerid, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %d, CAMERA_MOVE);", slx, sly, slz, elx, ely, elz, timeMs);
+
+    SendClientMessage(playerid, -1, "{AB7C4E}(CAM) Linhas geradas no console/log do servidor (procure por [CAM]).");
+    return 1;
+}
+
 CMD:iniciarvotacaokonoha(playerid, params[])
 {
     new candidato1k, candidato2k;
@@ -68271,199 +67559,10 @@ function TsuchikageEntrar(playerid)
     }
     return 1;
 }
-function TeclaBotaoMissaoKage(playerid, newkeys, oldkeys)
-{
-    if(BtnDireito[playerid] == 1) return 0;
-    if(PRESSED(KEY_CTRL_BACK)) {MissoesKagaFalas(playerid);}
-    return 1;
-}
-function MissoesKagaFalas(playerid)
-{
-    if(IsPlayerInRangeOfPoint(playerid, 1.5, 1404.9886, -1512.7532, 7.9219)) // Ingredientes
-    {
-        if(IdentMissaoKage[playerid] == 1 && Info[playerid][pMember] == 1) // Ingredientes Konoha
-        {
-            SetPlayerAttachedObject(playerid, 9, 15783, 5);
-            ApplyAnimation(playerid, "BOMBER", "BOM_Plant", 4.1, 0, 0, 0, 0, 1000, 1);
-            IdentEntregaMissaoKage[playerid] = 1;
-            SendClientMessage(playerid, COLOR_WHITE, "Irin: Leve os ingredientes o mais rapido possivel!");
-            KonohaCPIng[playerid] = SetPlayerCheckpoint(playerid, -1549.6923, 1627.0927, 2.1217, 2.0);
-        }
-        if(IdentMissaoKage[playerid] == 4 && Info[playerid][pMember] == 3) // Ingredientes Kiri
-        {
-            SetPlayerAttachedObject(playerid, 9, 15783, 5);
-            ApplyAnimation(playerid, "BOMBER", "BOM_Plant", 4.1, 0, 0, 0, 0, 1000, 1);
-            IdentEntregaMissaoKage[playerid] = 5;
-            SendClientMessage(playerid, COLOR_WHITE, "Irin: Leve os ingredientes o mais rapido possivel!");
-            KonohaCPIng[playerid] = SetPlayerCheckpoint(playerid, 2660.2820, -2696.3665, 35.5160, 2.0);
-        }
-    }
-    if(IsPlayerInRangeOfPoint(playerid, 1.5, 79.5390, 1327.8228, 24.1027)) // Medicamentos
-    {
-        if(IdentMissaoKage[playerid] == 3 && Info[playerid][pMember] == 1) // Medicamentos Konoha
-        {
-            SetPlayerAttachedObject(playerid, 9, 15783, 5);
-            ApplyAnimation(playerid, "BOMBER", "BOM_Plant", 4.1, 0, 0, 0, 0, 1000, 1);
-            SendClientMessage(playerid, COLOR_WHITE, "Aika: Melhor levar esses medicamentos o mais rapido possivel!");
-            IdentEntregaMissaoKage[playerid] = 3;
-            KonohaCPIng[playerid] = SetPlayerCheckpoint(playerid, -1650.1456, 1928.2588, 2.0320, 2.0);
-        }
-    }
-    if(IsPlayerInRangeOfPoint(playerid, 1.5, 79.5390, 1327.8228, 24.1027)) // Medicamentos
-    {
-        if(IdentMissaoKage[playerid] == 6 && Info[playerid][pMember] == 3) // Medicamentos Kiri
-        {
-            SetPlayerAttachedObject(playerid, 9, 15783, 5);
-            ApplyAnimation(playerid, "BOMBER", "BOM_Plant", 4.1, 0, 0, 0, 0, 1000, 1);
-            SendClientMessage(playerid, COLOR_WHITE, "Aika: Melhor levar esses medicamentos o mais rapido possivel!");
-            IdentEntregaMissaoKage[playerid] = 7;
-            KonohaCPIng[playerid] = SetPlayerCheckpoint(playerid, 2847.7170, -2590.1882, 35.8323, 2.0);
-        }
-    }
-    return 1;
-}
-function TeclaEntregaMissaoKage(playerid, newkeys, oldkeys)
-{
-    if(BtnDireito[playerid] == 1) return 0;
-    if(PRESSED(KEY_CTRL_BACK)) {EntregaKageMissao(playerid);}
-}
-function EntregaKageMissao(playerid)
-{
-    new str[124];
-    new pName[MAX_PLAYER_NAME];
-    GetPlayerName(playerid, pName, sizeof(pName));
-    if(IsPlayerInRangeOfPoint(playerid, 1.5, -1650.1456, 1928.2588, 2.0320))
-    {
-        if(IdentEntregaMissaoKage[playerid] == 2 && IdentMissaoKage[playerid] == 1) // Ingredientes Konoha
-        {
-            Audio_Play(playerid, 59);
-            KageRecompensa(playerid, GetPVarInt(playerid, "KageQuePassou"));
-            IdentEntregaMissaoKage[playerid] = 0;
-            InMissaoKage[playerid] = 0;
-            IdentMissaoKage[playerid] = 0;
-            GivePlayerCash(playerid, 120);
-            GivePlayerExperiencia(playerid, 2080);
-            SubirDLevel(playerid);
-            TogglePlayerControllable(playerid, 0);
-            format(str, sizeof(str), "120", str); // Ryos da Miss?o
-            PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][8], str);
-            format(str, sizeof(str), "280", str); // XP da Miss?o
-            PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][9], str);
-            format(str, sizeof(str), "0", str); // XP Extra da Miss?o
-            PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][10], str);
-            format(str, sizeof(str), "120", str); // Ryos da Miss?o
-            PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][11], str);
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][0]); // SUCESSO
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][1]); // BACKGROUND MISSAO COMPLETA
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][5]); // rank D
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][7]); // CARIMBO
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][8]); // Ryos da Miss?o
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][9]); // XP da Miss?o
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][10]); // XP extra da Miss?o
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][11]); // Ryos da Miss?o
-            TimingMissaoEnd[playerid] = SetTimerEx("HideGuardaCompleta", 3500, 1, "i", playerid);
-            format(str, sizeof(str), "{5FDE35}(AVISO){FFFFFF} O jogador {E9FE23}%s{FFFFFF} completou a miss?o {E9FE23}Ingredientes{FFFFFF}.", PlayerNameDados(playerid));
-            AvisoEntregaKage(COLOR_COMBINEDCHAT, str);
-        }
-        if(IdentEntregaMissaoKage[playerid] == 4 && IdentMissaoKage[playerid] == 3) // Medicamentos Konoha
-        {
-            Audio_Play(playerid, 59);
-            KageRecompensa(playerid, GetPVarInt(playerid, "KageQuePassou"));
-            IdentEntregaMissaoKage[playerid] = 0;
-            InMissaoKage[playerid] = 0;
-            IdentMissaoKage[playerid] = 0;
-            GivePlayerCash(playerid, 250);
-            GivePlayerExperiencia(playerid, 3015);
-            SubirDLevel(playerid);
-            TogglePlayerControllable(playerid, 0);
-            format(str, sizeof(str), "250", str); // Ryos da Miss?o
-            PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][8], str);
-            format(str, sizeof(str), "315", str); // XP da Miss?o
-            PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][9], str);
-            format(str, sizeof(str), "0", str); // XP Extra da Miss?o
-            PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][10], str);
-            format(str, sizeof(str), "250", str); // Ryos da Miss?o
-            PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][11], str);
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][0]); // SUCESSO
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][1]); // BACKGROUND MISSAO COMPLETA
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][5]); // rank D
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][7]); // CARIMBO
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][8]); // Ryos da Miss?o
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][9]); // XP da Miss?o
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][10]); // XP extra da Miss?o
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][11]); // Ryos da Miss?o
-            TimingMissaoEnd[playerid] = SetTimerEx("HideGuardaCompleta", 3500, 1, "i", playerid);
-            format(str, sizeof(str), "{5FDE35}(AVISO){FFFFFF} O jogador {E9FE23}%s{FFFFFF} completou a miss?o {E9FE23}Medicamentos{FFFFFF}.", PlayerNameDados(playerid));
-            AvisoEntregaKage(COLOR_COMBINEDCHAT, str);
-        }
-    }
-    if(IsPlayerInRangeOfPoint(playerid, 1.5, 2582.9031, -2301.9678, 64.5547)) // Kirigakure
-    {
-        if(IdentEntregaMissaoKage[playerid] == 6 && IdentMissaoKage[playerid] == 4) // Ingredientes Kiri
-        {
-            Audio_Play(playerid, 59);
-            KageRecompensa(playerid, GetPVarInt(playerid, "KageQuePassou"));
-            IdentEntregaMissaoKage[playerid] = 0;
-            InMissaoKage[playerid] = 0;
-            IdentMissaoKage[playerid] = 0;
-            GivePlayerCash(playerid, 120);
-            GivePlayerExperiencia(playerid, 2080);
-            SubirDLevel(playerid);
-            TogglePlayerControllable(playerid, 0);
-            format(str, sizeof(str), "120", str); // Ryos da Miss?o
-            PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][8], str);
-            format(str, sizeof(str), "280", str); // XP da Miss?o
-            PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][9], str);
-            format(str, sizeof(str), "0", str); // XP Extra da Miss?o
-            PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][10], str);
-            format(str, sizeof(str), "120", str); // Ryos da Miss?o
-            PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][11], str);
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][0]); // SUCESSO
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][1]); // BACKGROUND MISSAO COMPLETA
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][5]); // rank D
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][7]); // CARIMBO
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][8]); // Ryos da Miss?o
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][9]); // XP da Miss?o
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][10]); // XP extra da Miss?o
-            PlayerTextDrawShow(playerid, FinalizarMissao[playerid][11]); // Ryos da Miss?o
-            TimingMissaoEnd[playerid] = SetTimerEx("HideGuardaCompleta", 3500, 1, "i", playerid);
-            format(str, sizeof(str), "{5FDE35}(AVISO){FFFFFF} O jogador {E9FE23}%s{FFFFFF} completou a miss?o {E9FE23}Ingredientes{FFFFFF}.", PlayerNameDados(playerid));
-            AvisoEntregaKage2(COLOR_COMBINEDCHAT, str);
-        }
-        if(IdentEntregaMissaoKage[playerid] == 8 && IdentMissaoKage[playerid] == 6) // Medicamentos Kiri
-        {
-                Audio_Play(playerid, 59);
-                KageRecompensa(playerid, GetPVarInt(playerid, "KageQuePassou"));
-                IdentEntregaMissaoKage[playerid] = 0;
-                InMissaoKage[playerid] = 0;
-                IdentMissaoKage[playerid] = 0;
-                GivePlayerCash(playerid, 250);
-                GivePlayerExperiencia(playerid, 3015);
-                SubirDLevel(playerid);
-                TogglePlayerControllable(playerid, 0);
-                format(str, sizeof(str), "250", str); // Ryos da Miss?o
-                PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][8], str);
-                format(str, sizeof(str), "315", str); // XP da Miss?o
-                PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][9], str);
-                format(str, sizeof(str), "0", str); // XP Extra da Miss?o
-                PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][10], str);
-                format(str, sizeof(str), "250", str); // Ryos da Miss?o
-                PlayerTextDrawSetString(playerid, FinalizarMissao[playerid][11], str);
-                PlayerTextDrawShow(playerid, FinalizarMissao[playerid][0]); // SUCESSO
-                PlayerTextDrawShow(playerid, FinalizarMissao[playerid][1]); // BACKGROUND MISSAO COMPLETA
-                PlayerTextDrawShow(playerid, FinalizarMissao[playerid][5]); // rank D
-                PlayerTextDrawShow(playerid, FinalizarMissao[playerid][7]); // CARIMBO
-                PlayerTextDrawShow(playerid, FinalizarMissao[playerid][8]); // Ryos da Miss?o
-                PlayerTextDrawShow(playerid, FinalizarMissao[playerid][9]); // XP da Miss?o
-                PlayerTextDrawShow(playerid, FinalizarMissao[playerid][10]); // XP extra da Miss?o
-                PlayerTextDrawShow(playerid, FinalizarMissao[playerid][11]); // Ryos da Miss?o
-                TimingMissaoEnd[playerid] = SetTimerEx("HideGuardaCompleta", 3500, 1, "i", playerid);
-                format(str, sizeof(str), "{5FDE35}(AVISO){FFFFFF} O jogador {E9FE23}%s{FFFFFF} completou a miss?o {E9FE23}Medicamentos{FFFFFF}.", PlayerNameDados(playerid));
-                AvisoEntregaKage2(COLOR_COMBINEDCHAT, str);
-        }
-    }
-    return 1;
-}
+
+
+
+
 function KageRecompensa(playerid, kageid)
 {
     if(IdentMissaoKage[playerid] == 1) // Ingredientes Konoha
@@ -69963,748 +69062,10 @@ CMD:buffxp(playerid, params[])
     }
     return 1;
 }
-function MissoesPosicao(playerid)
-{
-    new Missoes = IdentMissaoNormal[playerid];
-    //Nevada
-    if(IsPlayerInRangeOfPoint(playerid, 1.5, 0.0, 0.0, 0.0)) // Guy Sensei Kiri e Iwagakure
-    {
-        if(EmMissaoNormal[playerid] == 0 && IdentMissaoNormal[playerid] == 0 && MissoesNormalOpen[playerid] == 0 && MissaoNormalFinalizada[playerid] == 0)
-        {
-            MostrarMissoes(playerid, 1);
-        }else if(MissaoNormalFinalizada[playerid] == 1){
-            switch(Missoes)
-            {
-                case 1:{//Excesso de Neve
-                    EmMissaoNormal[playerid] = 0;
-                    IdentMissaoNormal[playerid] = 0;
-                    MissoesNormalOpen[playerid] = 0;
-                    MissaoNormalFinalizada[playerid] = 0;
-                    Info[playerid][pMissaoN] = 1;
-                    GivePlayerCash(playerid, 25);
-                    if(BuffAtivado == 0){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 25);} // 0 porcento de xp
-                    if(BuffAtivado == 1){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 25);} // 5 porcento de xp
-                    if(BuffAtivado == 2){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 25);} // 7 porcento de xp
-                    if(BuffAtivado == 3){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 25);} // 10 porcento de xp
-                    if(BuffAtivado == 4){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 25);} // 15 porcento de xp
-                    Audio_Play(playerid, 59);
-                    SubirDLevel(playerid);
-                    SalvarConta(playerid);
-                }
-                case 2:{//Carga de Peixes
-                    EmMissaoNormal[playerid] = 0;
-                    IdentMissaoNormal[playerid] = 0;
-                    MissoesNormalOpen[playerid] = 0;
-                    MissaoNormalFinalizada[playerid] = 0;
-                    Info[playerid][pMissaoN] = 0;
-                    GivePlayerCash(playerid, 35);
-                    if(BuffAtivado == 0){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 35);} // 0 porcento de xp
-                    if(BuffAtivado == 1){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 35);} // 5 porcento de xp
-                    if(BuffAtivado == 2){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 35);} // 7 porcento de xp
-                    if(BuffAtivado == 3){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 35);} // 10 porcento de xp
-                    if(BuffAtivado == 4){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 35);} // 15 porcento de xp
-                    Audio_Play(playerid, 59);
-                    SubirDLevel(playerid);
-                    SalvarConta(playerid);
-                    //SendClientMessage(playerid, -1, "carga de peixes");
-                }
-            }
-            //SendClientMessage(playerid, COLOR_WHITE, "Entregar miss?o");
-        }
-    }else if(IsPlayerInRangeOfPoint(playerid, 1.5, 2830.6045, -2433.5054, 29.6660) && Info[playerid][pMember] == 3){// Kirigakure
-        if(EmMissaoNormal[playerid] == 0 && IdentMissaoNormal[playerid] == 0 && MissoesNormalOpen[playerid] == 0 && MissaoNormalFinalizada[playerid] == 0)
-        {
-            MostrarMissoes(playerid, 2);
-        }else if(MissaoNormalFinalizada[playerid] == 1){
-            switch(Missoes)
-            {
-                case 3:{///Mensagem ao Assistente - Kirigakure
-                    EmMissaoNormal[playerid] = 0;
-                    IdentMissaoNormal[playerid] = 0;
-                    MissoesNormalOpen[playerid] = 0;
-                    MissaoNormalFinalizada[playerid] = 0;
-                    Info[playerid][pMissaoKiri] = 1;
-                    GivePlayerCash(playerid, 100);
-                    if(BuffAtivado == 0){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 100);} // 0 porcento de xp
-                    if(BuffAtivado == 1){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 100);} // 5 porcento de xp
-                    if(BuffAtivado == 2){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 100);} // 7 porcento de xp
-                    if(BuffAtivado == 3){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 100);} // 10 porcento de xp
-                    if(BuffAtivado == 4){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 100);} // 15 porcento de xp
-                    Audio_Play(playerid, 59);
-                    SubirDLevel(playerid);
-                    SalvarConta(playerid);
-                    //SendClientMessage(playerid, -1, "Mensagem ao Assistente - Kirigakure");
-                }
-                case 4:{//Missoes do Gato - Kirigakure
-                    EmMissaoNormal[playerid] = 0;
-                    IdentMissaoNormal[playerid] = 0;
-                    MissoesNormalOpen[playerid] = 0;
-                    MissaoNormalFinalizada[playerid] = 0;
-                    Info[playerid][pMissaoKiri] = 2;
-                    GivePlayerCash(playerid, 150);
-                    if(BuffAtivado == 0){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 150);} // 0 porcento de xp
-                    if(BuffAtivado == 1){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 150);} // 5 porcento de xp
-                    if(BuffAtivado == 2){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 150);} // 7 porcento de xp
-                    if(BuffAtivado == 3){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 150);} // 10 porcento de xp
-                    if(BuffAtivado == 4){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 150);} // 15 porcento de xp
-                    Audio_Play(playerid, 59);
-                    SubirDLevel(playerid);
-                    SalvarConta(playerid);
-                    //SendClientMessage(playerid, -1, "Missoes do Gato - Kirigakure");
-                }
-                case 5:{//Encomenda Hospital - Kirigakure
-                    EmMissaoNormal[playerid] = 0;
-                    IdentMissaoNormal[playerid] = 0;
-                    MissoesNormalOpen[playerid] = 0;
-                    MissaoNormalFinalizada[playerid] = 0;
-                    Info[playerid][pMissaoKiri] = 0;
-                    GivePlayerCash(playerid, 150);
-                    if(BuffAtivado == 0){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 150);} // 0 porcento de xp
-                    if(BuffAtivado == 1){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 150);} // 5 porcento de xp
-                    if(BuffAtivado == 2){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 150);} // 7 porcento de xp
-                    if(BuffAtivado == 3){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 150);} // 10 porcento de xp
-                    if(BuffAtivado == 4){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 150);} // 15 porcento de xp
-                    Audio_Play(playerid, 59);
-                    SubirDLevel(playerid);
-                    SalvarConta(playerid);
-                    //SendClientMessage(playerid, -1, "Encomenda Hospital - Kirigakure");
-                }
-            }
-        }
-    }else if(IsPlayerInRangeOfPoint(playerid, 1.5, -1824.5286, 1882.3031, 2.0111) && Info[playerid][pMember] == 1){// Iwagakure
-        if(EmMissaoNormal[playerid] == 0 && IdentMissaoNormal[playerid] == 0 && MissoesNormalOpen[playerid] == 0 && MissaoNormalFinalizada[playerid] == 0)
-        {
-            MostrarMissoes(playerid, 3);
-        }else if(MissaoNormalFinalizada[playerid] == 1){
-            switch(Missoes)
-            {
-                case 6:{///Documentos Delegacia - Iwagakure
-                    EmMissaoNormal[playerid] = 0;
-                    IdentMissaoNormal[playerid] = 0;
-                    MissoesNormalOpen[playerid] = 0;
-                    MissaoNormalFinalizada[playerid] = 0;
-                    IwagakureIdentMissao[playerid] = 0;
-                    IwagakureCPNum[playerid] = 0;
-                    Info[playerid][pMissaoIwa] = 1;
-                    GivePlayerCash(playerid, 100);
-                    if(BuffAtivado == 0){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 500);} // 0 porcento de xp
-                    if(BuffAtivado == 1){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 500);} // 5 porcento de xp
-                    if(BuffAtivado == 2){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 500);} // 7 porcento de xp
-                    if(BuffAtivado == 3){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 500);} // 10 porcento de xp
-                    if(BuffAtivado == 4){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 500);} // 15 porcento de xp
-                    Audio_Play(playerid, 59);
-                    SubirDLevel(playerid);
-                    SalvarConta(playerid);
-                    //SendClientMessage(playerid, -1, "Documentos Delegacia - Iwagakure");
-                }
-                case 7:{///Encomenda Ichiraku - Iwagakure
-                    EmMissaoNormal[playerid] = 0;
-                    IdentMissaoNormal[playerid] = 0;
-                    MissoesNormalOpen[playerid] = 0;
-                    MissaoNormalFinalizada[playerid] = 0;
-                    IwagakureCPNum[playerid] = 0;
-                    Info[playerid][pMissaoIwa] = 2;
-                    GivePlayerCash(playerid, 500);
-                    if(BuffAtivado == 0){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 500);} // 0 porcento de xp
-                    if(BuffAtivado == 1){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 500);} // 5 porcento de xp
-                    if(BuffAtivado == 2){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 500);} // 7 porcento de xp
-                    if(BuffAtivado == 3){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 500);} // 10 porcento de xp
-                    if(BuffAtivado == 4){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 500);} // 15 porcento de xp
-                    Audio_Play(playerid, 59);
-                    SubirDLevel(playerid);
-                    SalvarConta(playerid);
-                    //SendClientMessage(playerid, -1, "Encomenda Ichiraku - Iwagakure");
-                }
-                case 9:{
-                    EmMissaoNormal[playerid] = 0;
-                    IdentMissaoNormal[playerid] = 0;
-                    MissoesNormalOpen[playerid] = 0;
-                    MissaoNormalFinalizada[playerid] = 0;
-                    IwagakureCPNum[playerid] = 0;
-                    Info[playerid][pMissaoIwa] = 0;
-                    MissaoTobyIdent[playerid] = 0;
-                    DestroyDynamicActor(DogTobbyObj[playerid]);
-                    GivePlayerCash(playerid, 550);
-                    if(BuffAtivado == 0){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 550);} // 0 porcento de xp
-                    if(BuffAtivado == 1){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 550);} // 5 porcento de xp
-                    if(BuffAtivado == 2){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 550);} // 7 porcento de xp
-                    if(BuffAtivado == 3){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 550);} // 10 porcento de xp
-                    if(BuffAtivado == 4){GivePlayerExperiencia(playerid, 1000); RyoseXPTxd(playerid, 1000, 550);} // 15 porcento de xp
-                    Audio_Play(playerid, 59);
-                    SubirDLevel(playerid);
-                    SalvarConta(playerid);
-                }
-            }
-        }
-    }
-    else if(IsPlayerInRangeOfPoint(playerid, 1.5, 205.5668, -769.1435, 13.9882)) // Konoha
-    {
-        if(EmMissaoNormal[playerid] == 0 && IdentMissaoNormal[playerid] == 0 && MissoesNormalOpen[playerid] == 0 && MissaoNormalFinalizada[playerid] == 0)
-        {
-            //MostrarMissoes(playerid, 4);
-        }
-        // Miss?o Concluida
-    }
-    return 1;
-}
-function TeclaMissoes(playerid, newkeys, oldkeys)
-{
-    if(BtnDireito[playerid] == 1) return 0;
-    if(PRESSED(KEY_CTRL_BACK)) {MissoesPosicao(playerid);}
-}
-function MostrarMissoes(playerid, type)
-{
-    new string[200];
-    switch(type)
-    {
-        //Nevada
-        case 1:
-        {
-            if(Info[playerid][pMissaoN] == 0){
-                MissoesNormalOpen[playerid] = 1;
-                TextDrawShowForPlayer(playerid, MissoesBKG[0]);
-                format(string, sizeof(string), "Aula de Movimentacao (RANK E)");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][0], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][0]); // Nome da Miss?o
-                format(string, sizeof(string), "Ola jovem ninja! Antes de tudo, voce deve dominar as tecnicas basicas de movimentacao. Vamos comecar?");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][1], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][1]); // Descri??o da Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][2], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][2]); // Ryos Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][3], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][3]); // XP Completa
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][4], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][4]); // Bonus XP Carta
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][5], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][5]); // Bonus XP Dia
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][6]); // Recusar
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][7]); // Aceitar
-                SelectTextDraw(playerid, 0xFF4040AA); // Ativar Sele??o
-                Audio_Play(playerid, 58);
-            }else if(Info[playerid][pMissaoN] == 1){
-                MissoesNormalOpen[playerid] = 2;
-                TextDrawShowForPlayer(playerid, MissoesBKG[0]);
-                format(string, sizeof(string), "Carga de Peixes (Rank D)");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][0], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][0]); // Nome da Miss?o
-                format(string, sizeof(string), "Eu preciso que voce leve esta encomenda de peixes para a fazenda aqui proximo la voce vai entregar e voltar ate mim para que eu possa lhe recompensar.");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][1], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][1]); // Descri??o da Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][2], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][2]); // Ryos Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][3], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][3]); // XP Completa
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][4], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][4]); // Bonus XP Carta
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][5], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][5]); // Bonus XP Dia
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][6]); // Recusar
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][7]); // Aceitar
-                SelectTextDraw(playerid, 0xFF4040AA); // Ativar Sele??o
-                Audio_Play(playerid, 58);
-            }
-            return 1;
-        }
-        //Nevada Final
-        //Kirigakure
-        case 2:
-        {
-            if(Info[playerid][pMissaoKiri] == 0){
-                MissoesNormalOpen[playerid] = 3;
-                TextDrawShowForPlayer(playerid, MissoesBKG[0]);
-                format(string, sizeof(string), "Mensagem ao Assistente (Rank D)");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][0], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][0]); // Nome da Miss?o
-                format(string, sizeof(string), "Preciso que leve esta carta ao Assistente que se encontra na sala do Kage, va e volte aqui para que eu possa lhe recompensar. Cuidado com esta carta!");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][1], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][1]); // Descri??o da Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][2], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][2]); // Ryos Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][3], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][3]); // XP Completa
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][4], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][4]); // Bonus XP Carta
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][5], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][5]); // Bonus XP Dia
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][6]); // Recusar
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][7]); // Aceitar
-                SelectTextDraw(playerid, 0xFF4040AA); // Ativar Sele??o
-                Audio_Play(playerid, 58);
-            }else if(Info[playerid][pMissaoKiri] == 1){
-                MissoesNormalOpen[playerid] = 4;
-                TextDrawShowForPlayer(playerid, MissoesBKG[0]);
-                format(string, sizeof(string), "Gato perdido (Rank D)");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][0], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][0]); // Nome da Miss?o
-                format(string, sizeof(string), "Um gato de uma garota fugiu de sua casa temos uma boa recompensa para aqueles que conseguir achar este gato!");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][1], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][1]); // Descri??o da Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][2], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][2]); // Ryos Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][3], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][3]); // XP Completa
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][4], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][4]); // Bonus XP Carta
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][5], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][5]); // Bonus XP Dia
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][6]); // Recusar
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][7]); // Aceitar
-                SelectTextDraw(playerid, 0xFF4040AA); // Ativar Sele??o
-                Audio_Play(playerid, 58);
-            }
-            else if(Info[playerid][pMissaoKiri] == 2){
-                MissoesNormalOpen[playerid] = 5;
-                TextDrawShowForPlayer(playerid, MissoesBKG[0]);
-                format(string, sizeof(string), "Encomenda Hospital (Rank D)");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][0], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][0]); // Nome da Miss?o
-                format(string, sizeof(string), "Preciso de sua ajuda para uma emergencia, um policial nosso esta passando por alguns problemas de saude precisamos que busque uma encomenda de medicamentos e entregue no hospital!");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][1], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][1]); // Descri??o da Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][2], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][2]); // Ryos Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][3], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][3]); // XP Completa
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][4], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][4]); // Bonus XP Carta
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][5], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][5]); // Bonus XP Dia
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][6]); // Recusar
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][7]); // Aceitar
-                SelectTextDraw(playerid, 0xFF4040AA); // Ativar Sele??o
-                Audio_Play(playerid, 58);
-            }
-        }
-        //Kirigakure Final
-        //Iwagakure Inicio
-        //Iwagakure Final
-        case 3:{
-            if(Info[playerid][pMissaoIwa] == 0){
-                MissoesNormalOpen[playerid] = 6;
-                TextDrawShowForPlayer(playerid, MissoesBKG[0]);
-                format(string, sizeof(string), "Documentos Delegacia (Rank D)");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][0], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][0]); // Nome da Miss?o
-                format(string, sizeof(string), "Recebemos uma solicitacao da delegacia para autorizar alguns procedimentos pela vila, por favor va ate a delegacia e pegue os documentos que esta com o policial e traga pra mim pra eu assinar!");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][1], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][1]); // Descri??o da Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][2], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][2]); // Ryos Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][3], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][3]); // XP Completa
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][4], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][4]); // Bonus XP Carta
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][5], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][5]); // Bonus XP Dia
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][6]); // Recusar
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][7]); // Aceitar
-                SelectTextDraw(playerid, 0xFF4040AA); // Ativar Sele??o
-                Audio_Play(playerid, 58);
-            }
-            if(Info[playerid][pMissaoIwa] == 1){
-                MissoesNormalOpen[playerid] = 7;
-                TextDrawShowForPlayer(playerid, MissoesBKG[0]);
-                format(string, sizeof(string), "Encomenda Ichiraku (Rank D)");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][0], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][0]); // Nome da Miss?o
-                format(string, sizeof(string), "Pegue uma encomenda que se encontra na vila da cachoeira e leve ela ate o Ichiraku apos volte aqui que irei lhe recompensar!");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][1], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][1]); // Descri??o da Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][2], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][2]); // Ryos Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][3], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][3]); // XP Completa
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][4], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][4]); // Bonus XP Carta
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][5], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][5]); // Bonus XP Dia
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][6]); // Recusar
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][7]); // Aceitar
-                SelectTextDraw(playerid, 0xFF4040AA); // Ativar Sele??o
-                Audio_Play(playerid, 58);
-            }
-            if(Info[playerid][pMissaoIwa] == 2)
-            {
-                MissoesNormalOpen[playerid] = 9;
-                TextDrawShowForPlayer(playerid, MissoesBKG[0]);
-                format(string, sizeof(string), "Resgate (Rank D)");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][0], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][0]); // Nome da Miss?o
-                format(string, sizeof(string), "Um dos cachorros do departamento de policia de Iwagakure fugiu do treinamento, a sua missao e encontra-lo. Va para a delegacia pegar as informacoes sobre o cachorro!");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][1], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][1]); // Descri??o da Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][2], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][2]); // Ryos Miss?o
-                format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][3], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][3]); // XP Completa
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][4], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][4]); // Bonus XP Carta
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][5], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][5]); // Bonus XP Dia
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][6]); // Recusar
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][7]); // Aceitar
-                SelectTextDraw(playerid, 0xFF4040AA); // Ativar Sele??o
-                Audio_Play(playerid, 58);
-            }
-        }
-        //Konoha Inicio
-        case 4:
-        {
-            if(Info[playerid][pMissaoKonoha] == 0){
-                MissoesNormalOpen[playerid] = 8;
-                TextDrawShowForPlayer(playerid, MissoesBKG[0]);
-                format(string, sizeof(string), "Missao da Flor da Lua (Rank S)");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][0], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][0]); // Nome da Miss?o
-                format(string, sizeof(string), "Neste mundo ha uma lenda sobre uma flor rara chamada Flor da Lua que floresce apenas umas vez por mes em um local secreto a lenda diz que esta flor tem o poder de selar o amor verdadeiro e fortalecer os lacos entre as pessoas. Voce quer ir encontrar-la?");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][1], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][1]); // Descri??o da Miss?o
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][2], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][2]); // Ryos Miss?o
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][3], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][3]); // XP Completa
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][4], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][4]); // Bonus XP Carta
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][5], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][5]); // Bonus XP Dia
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][6]); // Recusar
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][7]); // Aceitar
-                SelectTextDraw(playerid, 0xFF4040AA); // Ativar Sele??o
-                Audio_Play(playerid, 58);
-            }
-        }
-        case 5: // MISS?O KAGE (Ramen)
-        {
-            if(MissaoKageID[playerid] == 0)
-            {
-                AbriuMissaoKage[playerid] = 1;
-                TextDrawShowForPlayer(playerid, MissoesBKG[0]);
-                format(string, sizeof(string), "Missao Ramen (Estoque) (RANK E)");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][0], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][0]); // Nome da Miss?o
-                format(string, sizeof(string), "Busque uma encomenda de alimentos no Velho Tronco e leve para o Ichiraku");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][1], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][1]); // Descri??o da Miss?o
-                if(Info[playerid][pMember] == 1)
-                {
-                    format(string, sizeof(string), "1000");
-                    PlayerTextDrawSetString(playerid, MissoesNew[playerid][2], string);
-                }
-                if(Info[playerid][pMember] == 3 || Info[playerid][pMember] == 5)
-                {
-                    format(string, sizeof(string), "1000");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][2], string);
-                }
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][2]); // Ryos Miss?o
-                if(Info[playerid][pMember] == 1)
-                {
-                    format(string, sizeof(string), "1000");
-                    PlayerTextDrawSetString(playerid, MissoesNew[playerid][3], string);
-                }
-                if(Info[playerid][pMember] == 3 || Info[playerid][pMember] == 5)
-                {
-                    format(string, sizeof(string), "1000");
-                    PlayerTextDrawSetString(playerid, MissoesNew[playerid][3], string);
-                }
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][3]); // XP Completa
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][4], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][4]); // Bonus XP Carta
-                format(string, sizeof(string), "0");
-                PlayerTextDrawSetString(playerid, MissoesNew[playerid][5], string);
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][5]); // Bonus XP Dia
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][6]); // Recusar
-                PlayerTextDrawShow(playerid, MissoesNew[playerid][7]); // Aceitar
-                SelectTextDraw(playerid, 0xFF4040AA); // Ativar Sele??o
-                Audio_Play(playerid, 58);
-            }
-        }
 
-    }
-    return 0;
-}
-AoClicarNaMissoes(playerid, PlayerText:playertextid)
-{
-    new string[128],
-        Missoes = MissoesNormalOpen[playerid], stringki[220];
-    new MissoesKage = AbriuMissaoKage[playerid];
-    new SenseiNome[64];
-    if(playertextid == MissoesNew[playerid][6]) // Recusar
-    {
-        TogglePlayerControllable(playerid, true);
-        MissoesNormalOpen[playerid] = 0;
-        AbriuMissaoKage[playerid] = 0;
-        TextDrawHideForPlayer(playerid, MissoesBKG[0]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][0]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][1]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][2]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][3]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][4]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][5]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][6]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][7]);
-        CancelSelectTextDraw(playerid);
-        Audio_Play(playerid, 58);
-        return 1;
-    }
-    if(playertextid == MissoesNew[playerid][7]) // Aceitar
-    {
-        if(MissoesKage == 1)
-        {
-            //Miss?o ESTOQUE RAMEN KIRI
-                if(Info[playerid][pMember] == 1){MissaoKageID[playerid] = 3;}// Iwagakure
-                else if(Info[playerid][pMember] == 3){MissaoKageID[playerid] = 1;}// Kirigakure
-                else if(Info[playerid][pMember] == 5){MissaoKageID[playerid] = 4;}// Kumogakure
 
-                format(stringki, sizeof(stringki), "{AB7C4E}(MISS?O) Voc? recebeu a miss?o de ir buscar uma encomenda de alimentos.");
-                SendClientMessage(playerid, 1, stringki);
-                format(stringki, sizeof(stringki), "{AB7C4E}(KAGE) O ninja {FFFFFF}%s{AB7C4E} aceitou a miss?o (ESTOQUE RAMEN).", PlayerNameDados(playerid));
-                SendClientMessage(KageQuePassouM[playerid], 1, stringki);
-                AbriuMissaoKage[playerid] = 0;
-                SetPlayerCheckpoint(playerid, 1358.3079, -1502.4524, 8.2853, 5.0);
 
-                TextDrawHideForPlayer(playerid, MissoesBKG[0]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][0]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][1]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][2]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][3]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][4]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][5]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][6]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][7]);
-                CancelSelectTextDraw(playerid);
-                Audio_Play(playerid, 58);
-        }
-        /*switch(MissoesKage)
-        {
-            case 0: return 0;
-            case 1:{
-                //Miss?o ESTOQUE RAMEN KIRI
-                if(Info[playerid][pMember] == 1){MissaoKageID[playerid] = 3;}// Iwagakure
-                else if(Info[playerid][pMember] == 3){MissaoKageID[playerid] = 1;}// Kirigakure
 
-                format(stringki, sizeof(stringki), "{AB7C4E}(MISS?O) Voc? recebeu a miss?o de ir buscar uma encomenda de alimentos.");
-                SendClientMessage(playerid, 1, stringki);
-                format(stringki, sizeof(stringki), "{AB7C4E}(KAGE) O ninja {FFFFFF}%s{AB7C4E} aceitou a miss?o (ESTOQUE RAMEN).", PlayerNameDados(playerid));
-                SendClientMessage(KageQuePassouM[playerid], 1, stringki);
-                AbriuMissaoKage[playerid] = 0;
-                SetPlayerCheckpoint(playerid, 1358.3079, -1502.4524, 8.2853, 5.0);
-
-                TextDrawHideForPlayer(playerid, MissoesBKG[0]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][0]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][1]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][2]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][3]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][4]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][5]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][6]);
-                PlayerTextDrawHide(playerid, MissoesNew[playerid][7]);
-                CancelSelectTextDraw(playerid);
-                Audio_Play(playerid, 58);
-            }
-        }*/
-        switch(Missoes)
-        {
-            case 0: return 0;
-            case 1:{//Movimentacao Miss?o
-                KillTimer(TimerCPAcademia[playerid]);
-                KillTimer(TimerNPCAcademia[playerid]);
-                EmMissaoNormal[playerid] = 1;
-                IdentMissaoNormal[playerid] = 1;
-                MissaoCPAcademia[playerid] = 0;
-                TogglePlayerControllable(playerid, false);
-                //Dialogo
-                SenseiNome = "Guy Sensei";
-                PlayerTextDrawShow(playerid, MissaoDialogo[playerid][0]); // Dialogo
-                format(stringki, sizeof(stringki), "%s", SenseiNome);
-                PlayerTextDrawSetString(playerid, MissaoDialogo[playerid][1], stringki);
-                PlayerTextDrawShow(playerid, MissaoDialogo[playerid][1]); // Nome
-                format(stringki, sizeof(stringki), "Estarei lhe esperando no local para iniciarmos o treinamento de movimentacao.");
-                PlayerTextDrawShow(playerid, MissaoDialogo[playerid][2]); // Texto
-                SetPlayerVirtualWorld(playerid, 50);
-                NPCMissaoAcademia[playerid] = CreateDynamicActor(125, 2865.6816, -2411.9387, 41.4118, 222.9284, 1, 100.0, 50, -1, playerid, 50);
-                TimerNPCAcademia[playerid] = SetTimerEx("InicioMissaoMove", 2500, false, "d", playerid);
-                //Tempo para npc
-
-            }
-            case 2:{
-                //Encomenda de Peixes
-                EmMissaoNormal[playerid] = 2;
-                IdentMissaoNormal[playerid] = 2;
-                format(stringki, sizeof(stringki), "{AB7C4E}(MISS?O) {FFFFFF}Voc? recebeu uma {AB7C4E}Encomenda de Peixes{FFFFFF}, entregue-a em uma fazenda proxima!");
-                SendClientMessage(playerid, COLOR_WHITE, stringki);
-                NevadaPeixesCP[playerid] = SetPlayerCheckpoint(playerid, 2107.3193, -952.6356, 80.7842, 2.0);
-            }
-            //Nevada Final
-            //Kirigakure Inicio
-            case 3:{//Mensagem ao Assistente
-                EmMissaoNormal[playerid] = 3;
-                IdentMissaoNormal[playerid] = 3;
-                format(stringki, sizeof(stringki), "{AB7C4E}(MISS?O) {FFFFFF}Voc? recebeu uma {AB7C4E}carta{FFFFFF} leve para o assistente na sala do Kage!");
-                SendClientMessage(playerid, COLOR_WHITE, stringki);
-                KirigakureMissao1CP[playerid] = SetPlayerCheckpoint(playerid, 2583.4741, -2301.5586, 64.5547, 2.0);
-            }
-            case 4:{//Gato perdido
-                new GatoPos = random(6);
-                new GatoID = 15821;
-                switch(GatoPos)
-                {
-                    case 0:{
-                        EmMissaoNormal[playerid] = 4;
-                        IdentMissaoNormal[playerid] = 4;
-
-                        KirigakureMissao2NM[playerid] = 1;
-                        ObjKirigakureGato[playerid] = CreateObject(GatoID, 2876.1316, -2652.3762, 34.5156, 0.0, 0.0, 96.0, 300.0); // OK
-
-                        SetPlayerCheckpoint(playerid, 2876.1316, -2652.3762, 34.5156, 2.0);
-                    }
-                    case 1:{
-                        EmMissaoNormal[playerid] = 4;
-                        IdentMissaoNormal[playerid] = 4;
-
-                        KirigakureMissao2NM[playerid] = 2;
-                        ObjKirigakureGato[playerid] = CreateObject(GatoID, 2656.1375, -2660.8972, 43.2024, 0.0, 0.0, 96.0, 300.0); // OK
-
-                        SetPlayerCheckpoint(playerid, 2656.1375, -2660.8972, 43.2024, 2.0);
-                    }
-                    case 2:{
-                        EmMissaoNormal[playerid] = 4;
-                        IdentMissaoNormal[playerid] = 4;
-
-                        KirigakureMissao2NM[playerid] = 3;
-                        ObjKirigakureGato[playerid] = CreateObject(GatoID, 2258.9939, -2726.3262, 28.8453, 0.0, 0.0, 96.0, 300.0); // OK
-
-                        SetPlayerCheckpoint(playerid, 2258.9939, -2726.3262, 28.8453, 2.0);
-                    }
-                    case 3:{
-                        EmMissaoNormal[playerid] = 4;
-                        IdentMissaoNormal[playerid] = 4;
-
-                        KirigakureMissao2NM[playerid] = 4;
-                        ObjKirigakureGato[playerid] = CreateObject(GatoID, 2660.7400, -2499.0811, 28.5719, 0.0, 0.0, 96.0, 300.0); // OK
-
-                        SetPlayerCheckpoint(playerid, 2660.7400, -2499.0811, 28.5719, 2.0);
-                    }
-                    case 4:{
-                        EmMissaoNormal[playerid] = 4;
-                        IdentMissaoNormal[playerid] = 4;
-
-                        KirigakureMissao2NM[playerid] = 5;
-                        ObjKirigakureGato[playerid] = CreateObject(GatoID, 2310.7656, -2258.2722, 52.9607, 0.0, 0.0, 96.0, 300.0); // OK
-
-                        SetPlayerCheckpoint(playerid, 2310.7656, -2258.2722, 52.9607, 2.0);
-                    }
-                    case 5:{
-                        EmMissaoNormal[playerid] = 4;
-                        IdentMissaoNormal[playerid] = 4;
-
-                        KirigakureMissao2NM[playerid] = 6;
-                        ObjKirigakureGato[playerid] = CreateObject(GatoID, 2512.4011, -2119.1233, 81.7266, 0.0, 0.0, 96.0, 300.0); // OK
-
-                        SetPlayerCheckpoint(playerid, 2512.4011, -2119.1233, 81.7266, 2.0);
-                    }
-                }
-                format(stringki, sizeof(stringki), "{AB7C4E}(MISS?O) {FFFFFF}Procure o {AB7C4E}gato{FFFFFF} perdido e {AB7C4E}leve-o ate o sensei{FFFFFF} na academia!");
-                SendClientMessage(playerid, COLOR_WHITE, stringki);
-                //format(string, sizeof(string), "O a posi??o do gato foi (%d)", GatoPos);
-                //SendClientMessage(playerid, COLOR_WHITE, string);
-
-            }
-            case 5:{
-                EmMissaoNormal[playerid] = 5;
-                IdentMissaoNormal[playerid] = 5;
-                KirigakureHospitalCP[playerid] = SetPlayerCheckpoint(playerid, 2538.404785, -861.105651, 29.422710, 2.0);
-                format(stringki, sizeof(stringki), "{AB7C4E}(MISS?O) {FFFFFF}V? ate a vila de {AB7C4E}Tetsugakure{FFFFFF} buscar uma {AB7C4E}encomenda{FFFFFF} para o hospital.");
-                SendClientMessage(playerid, COLOR_WHITE, stringki);
-            }
-            //Kirigakure Final
-            //Iwagakure Inicio
-            case 6:{
-                EmMissaoNormal[playerid] = 6;
-                IdentMissaoNormal[playerid] = 6;
-                IwagakureIdentMissao[playerid] = 1;
-                IwagakureDelegaciaCP[playerid] = SetPlayerCheckpoint(playerid, -1397.9189, 1549.5508, 7.8914, 2.0);
-                format(stringki, sizeof(stringki), "{AB7C4E}(MISS?O) {FFFFFF}Voc? recebeu a tarefa de {AB7C4E}Pegar Documentos{FFFFFF} na delegacia, retorne para receber sua recompensa!");
-                SendClientMessage(playerid, COLOR_WHITE, stringki);
-            }
-            case 7:{
-                EmMissaoNormal[playerid] = 7;
-                IdentMissaoNormal[playerid] = 7;
-                IwagakureIchirakuNUM[playerid] = 1;
-                IwagakureIchirakuCP[playerid] = SetPlayerCheckpoint(playerid, 179.9275, 1333.1051, 3.4164, 2.0);
-                format(stringki, sizeof(stringki), "{AB7C4E}(MISS?O) {FFFFFF}V? e pegue uma {AB7C4E}Encomenda{FFFFFF} na vila da cachoeira e leve ela ate o Ichiraku");
-                SendClientMessage(playerid, COLOR_WHITE, stringki);
-            }
-            case 9:{
-                MissaoTobyIdent[playerid] = 6;
-                EmMissaoNormal[playerid] = 9;
-                IdentMissaoNormal[playerid] = 9;
-                CPDogDP[playerid] = SetPlayerCheckpoint(playerid, -1404.7218, 1541.1235, 7.8914, 2.0);
-                format(stringki, sizeof(stringki), "{AB7C4E}(MISS?O) {FFFFFF}V? ate a delegacia e pegue a {AB7C4E}Informa?ao{FFFFFF} sobre o cachorro desaparecido.");
-                SendClientMessage(playerid, COLOR_WHITE, stringki);
-            }
-            //Iwagakure Final
-            //Konoha Inicio
-            case 8:{
-                EmMissaoNormal[playerid] = 8;
-                IdentMissaoNormal[playerid] = 8;
-                FlorDaLuaMissaoIdent[playerid] = 1; // Identidade da Miss?o da Lua para usar comando
-                format(stringki, sizeof(stringki), "{AB7C4E}(MISS?O){FFFFFF} Voc? precisa convidar uma pessoa para essa miss?o. {AB7C4E}Use o comando /convidarmissao{FFFFFF}.");
-                SendClientMessage(playerid, COLOR_WHITE, stringki);
-            }
-            //Konoha Final
-        }
-        MissoesNormalOpen[playerid] = 0;
-        TextDrawHideForPlayer(playerid, MissoesBKG[0]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][0]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][1]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][2]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][3]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][4]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][5]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][6]);
-        PlayerTextDrawHide(playerid, MissoesNew[playerid][7]);
-        CancelSelectTextDraw(playerid);
-        Audio_Play(playerid, 58);
-    }
-    return 0;
-}
 function MissoesKageTecla(playerid, newkeys)
 {
     new string[132];
@@ -71060,7 +69421,7 @@ function SustJutsu(playerid)
     GetPlayerPos(playerid, Pos[0], Pos[1], Pos[2]);
     Info[playerid][pCharKawarimi] = SkinSust[playerid];
 
-// Antes, zera pra não destruir lixo antigo
+// Antes, zera pra no destruir lixo antigo
 HumoSust[playerid] = -1;
 Tronco[playerid]   = -1;
 
@@ -71077,7 +69438,7 @@ else
     MoveObject(Tronco[playerid], Pos[0], Pos[1], Pos[2]-12.0, 1.0, 0.0, 0.0, 0.0);
     AudioInPlayer(playerid, 25.0, 144);
 
-    // Só agenda destruição quando criou mesmo
+    // S agenda destruio quando criou mesmo
     SetTimerEx("DestroyHumo", 200, false, "i", playerid);
     SetTimerEx("DestroyTronco", 2750, false, "i", playerid);
 }
@@ -71103,7 +69464,7 @@ else
 
     foreach(Player, i)
     {
-        if(IsPlayerNPC(i)) continue;  // <<< FIX CRÍTICO
+        if(IsPlayerNPC(i)) continue;  // <<< FIX CRTICO
            ShowPlayerNameTagForPlayer(i, playerid, 0);
     }
 
@@ -74320,7 +72681,13 @@ function PersonagemCorrendoC(playerid)
 }
 function TelaLogin(playerid)
 {
-    KillTimer(TimerCarregamento[playerid][1]);
+    // Evita matar timer duas vezes (esse function pode ser chamado novamente se estiver aguardando backend)
+    if(TimerCarregamento[playerid][1] != 0)
+    {
+        KillTimer(TimerCarregamento[playerid][1]);
+        TimerCarregamento[playerid][1] = 0;
+    }
+
     Streamer_Update(playerid);
     PlayerTextDrawHide(playerid, LoadBKG[playerid][0]);//background
     PlayerTextDrawHide(playerid, LoadPersonagemR[playerid][0]);//Personagem Correndo = 0
@@ -74329,15 +72696,78 @@ function TelaLogin(playerid)
     Audio_Play(playerid, 55);
     ClearChatbox(playerid);
     TextDrawHideForPlayer(playerid, box);
-    new playername[MAX_PLAYER_NAME];
-    GetPlayerName(playerid, playername, sizeof(playername));
+
     TextDrawHideForPlayer(playerid, cargando);
     TextDrawHideForPlayer(playerid, looking);
     TextDrawHideForPlayer(playerid, box);
+
+    new playername[MAX_PLAYER_NAME];
+    GetPlayerName(playerid, playername, sizeof(playername));
+
+    // ===================== Launcher Gate =====================
+    #if LAUNCHER_REQUIRE_TOKEN
+        if(LauncherAuth_IsTokenNick(playername))
+        {
+            if(gLauncherAuthState[playerid] == LAUTH_PENDING)
+            {
+                // Ainda aguardando o backend validar e trocar o nick
+                GameTextForPlayer(playerid, "~w~Validando~n~~r~LAUNCHER...", 2000, 3);
+                SetTimerEx("TelaLogin", 650, false, "d", playerid);
+                return 1;
+            }
+
+            if(gLauncherAuthState[playerid] != LAUTH_OK)
+            {
+                SendClientMessage(playerid, 0xFF4444FF, "Falha ao validar o Launcher. Abra o jogo pelo Launcher e tente novamente.");
+                Kick(playerid);
+                return 1;
+            }
+
+            // Se chegou aqui: nick j foi trocado no callback.
+            GetPlayerName(playerid, playername, sizeof(playername));
+        }
+    #endif
+
+    // ===================== Auto-login (sem senha) =====================
+    #if LAUNCHER_AUTOLOGIN
+        if(gLauncherAuthState[playerid] == LAUTH_OK && !gLauncherAutoLoginDone[playerid])
+        {
+            gLauncherAutoLoginDone[playerid] = 1;
+            InsideMainMenu[playerid] = false;
+
+            if(INI_Exist(playername))
+            {
+                gPlayerAccount[playerid] = 1;
+                INI_ParseFile(UserPath(playerid), "LoadUser_data", .bExtra = true, .extra = playerid);
+                Clan_EnsureDefaults(playerid);
+
+
+                // Binds por conta (usa nick como chave)
+                new acc[MAX_PLAYER_NAME];
+                GetPlayerName(playerid, acc, sizeof acc);
+                HBCH_Binds_OnLogin(playerid, acc);
+
+                PlayerLogin(playerid);
+                return 1;
+            }
+            else
+            {
+                gPlayerAccount[playerid] = 0;
+
+                // senha "dummy" (nunca ser usada porque sem launcher no entra)
+                new pass[13];
+                format(pass, sizeof(pass), "TK%06d", random(1000000));
+
+                OnPlayerRegister(playerid, pass);
+                return 1;
+            }
+        }
+    #endif
+
+    // ===================== Fluxo original (com senha) =====================
     if(INI_Exist(playername))
     {
         gPlayerAccount[playerid] = 1;
-        //ShowLoginMenu(playerid);
         ShowMainMenuDialog(playerid, 1);
         return 1;
     }
@@ -74349,6 +72779,7 @@ function TelaLogin(playerid)
     }
     return 1;
 }
+
 // === Hit Count - Combos === //
 function HitCountCombos(playerid)
 {
@@ -76063,6 +74494,7 @@ CMD:prender(playerid, params[])
                     case 4: {SetPlayerPos(alvo, 2308.2449, -2257.8733, 47.7732);} // sela 5
                 }
                 Info[alvo][pPrisaoPolicial] = minutos*60;
+                ProfServ_OnPolicePrender(playerid, alvo, minutos);
                 Info[alvo][pPrisaoLocal] = 1;
                 Info[alvo][pDentroDeCasa] = 1;
                 PoliciaTempo[alvo] = gettime();
@@ -76088,6 +74520,7 @@ CMD:prender(playerid, params[])
                     case 4: {SetPlayerPos(alvo, -1400.1187, 1565.0771, 24.9930);} // sela 5
                 }
                 Info[alvo][pPrisaoPolicial] = minutos*60;
+                ProfServ_OnPolicePrender(playerid, alvo, minutos);
                 Info[alvo][pPrisaoLocal] = 2;
                 Info[alvo][pDentroDeCasa] = 1;
                 PoliciaTempo[alvo] = gettime();
@@ -77304,19 +75737,20 @@ function EscolhaCla(playerid)
     if(Info[playerid][pClan] == 0){
         if(SorteioCla == 0 || SorteioCla == 1 || SorteioCla == 2){
             Info[playerid][pClan] = 1; // Senju
-            SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Voc? recebeu o Cl? ({FFFFFF}Senju{AB7C4E}).");
+            SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Parabns, seu cl ({FFFFFF}Senju{AB7C4E}) acabou de despertar.");
         }
         else if(SorteioCla == 3 || SorteioCla == 4 || SorteioCla == 5){
             Info[playerid][pClan] = 2; // Uchiha
-            SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Voc? recebeu o Cl? ({FFFFFF}Uchiha{AB7C4E}).");
+            SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Parabns, seu cl  ({FFFFFF}Uchiha{AB7C4E})acabou de despertar.");
         }
         else if(SorteioCla == 6 || SorteioCla == 7 || SorteioCla == 8){
             Info[playerid][pClan] = 3; // Nara
-            SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Voc? recebeu o Cl? ({FFFFFF}Nara{AB7C4E}).");
+            SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Parabns, seu cl  ({FFFFFF}Nara{AB7C4E})acabou de despertar.");
         }
          else if(SorteioCla == 9 || SorteioCla == 10 || SorteioCla == 11){
             Info[playerid][pClan] = 4; // Hyuuga
-            SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Voc? recebeu o Cl? ({FFFFFF}Hyuuga{AB7C4E}).");
+            Info[playerid][pClanNivel] = 1; //nivel cl
+            SendClientMessage(playerid, -1, "{AB7C4E}(AVISO) Parabns, seu cl  ({FFFFFF}Hyuuga{AB7C4E})acabou de despertar.");
         }
     }
     return 1;
@@ -78553,168 +76987,7 @@ function MesuChakra(playerid)
     }
     return 1;
 }
-#define SAPO_COOLDOWN 0
-#define SAPO_TIMING   100000    // 20 segundos de dura??o do jutsu
 
-enum dataSapoInvocacao
-{
-    sapoAtivo,
-    sapoCast,
-    sapoTimer,
-    sapoObj,
-    sapoObjs[9]
-}
-
-new SapoInvocacao[MAX_PLAYERS][dataSapoInvocacao];
-new TimerSapo[MAX_PLAYERS];
-new TimerSapoInvocacao[MAX_PLAYERS];
-
-function SapoInvocacaoJutsu(playerid)
-{
-
-    // Se j? tiver ativo -> desativa manual
-    if(SapoInvocacao[playerid][sapoAtivo])
-    {
-        DesativarSapoInvocacao(playerid, true);
-        return 1;
-    }
-    if(Info[playerid][pProgressoHP] >= 10000)
-          return 0;
-    // Verificar chakra
-    if(Info[playerid][pChakraEnUso] < 5000.0)
-        return SemChakra(playerid);
-
-    // Verificar cooldown
-    if(SapoInvocacao[playerid][sapoTimer] > gettime())
-        return JutsuNotReady2(playerid, COLOR_WHITE, "Jutsu de Invoca??o: Pris?o Do Sapo Guardi?o!", SapoInvocacao[playerid][sapoTimer]);
-
-    // Verificar se est? no ch?o
-    new Float:x, Float:y, Float:z;
-    new Float:vx, Float:vy, Float:vz;
-    GetPlayerPos(playerid, x, y, z);
-    GetPlayerVelocity(playerid, vx, vy, vz);
-    if(vz != 0.0)
-        return SendClientMessageEx(playerid, COLOR_WHITE, "{EF0D02}(JUTSU) Voc? precisa estar no ch?o para usar este jutsu.");
-
-    // Gasta chakra
-    Info[playerid][pChakraEnUso] -= 5000.0;
-
-    // Limpar selos
-    ClearSelo(playerid);
-
-    // Anima??o
-    ApplyAnimation(playerid, "MokutonAnim", "Mokuton01", 1.0, 0, 0, 0, 0, 0, 1);
-
-    // Fala
-    SapoInvocacaoSay(playerid);
-
-    // Som para todos players pr?ximos
-    for(new i=0; i<MAX_PLAYERS; i++)
-    {
-        if(IsPlayerConnected(i) && IsPlayerInRangeOfPoint(i, 50.0, x, y, z))
-        {
-            AudioInPlayer(i, 200.0, 72);
-        }
-    }
-
-    // Registrar cooldown
-    SapoInvocacao[playerid][sapoTimer] = gettime() + SAPO_COOLDOWN;
-
-    // Delay para o sapo aparecer (ap?s a anima??o)
-    SetTimerEx("CriarSapoInvocacao", 300, false, "i", playerid);
-    return 1;
-}
-
-public CriarSapoInvocacao(playerid)
-{
-    if(!IsPlayerConnected(playerid)) return 0;
-
-    new Float:x, Float:y, Float:z, Float:a;
-    GetPlayerFacingAngle(playerid, a);
-    GetPlayerPos(playerid, x, y, z);
-    GetXYInFrontOfPlayer(playerid, x, y, 9.0);
-
-    // Criar sapo
-    SapoInvocacao[playerid][sapoObj] = CreateObject(18637, x, y, z+3.0, 0, 0, a);
-
-    // Criar caixa de pedra (8 objetos: 4 paredes + ch?o + 2 tetos)
-    SapoInvocacao[playerid][sapoObjs][0] = CreateObject(12044, x+5.0, y, z, 0, 0, 90);   // parede direita
-    SapoInvocacao[playerid][sapoObjs][1] = CreateObject(12044, x-5.0, y, z, 0, 0, 270);  // parede esquerda
-    SapoInvocacao[playerid][sapoObjs][2] = CreateObject(12044, x, y+5.0, z, 0, 0, 0);    // parede frente
-    SapoInvocacao[playerid][sapoObjs][3] = CreateObject(12044, x, y-5.0, z, 0, 0, 180);  // parede tr?s
-    SapoInvocacao[playerid][sapoObjs][4] = CreateObject(12044, x, y, z+3.0, 90, 0, 0);   // teto
-    SapoInvocacao[playerid][sapoObjs][5] = CreateObject(12044, x, y+3.0, z+3.0, 90, 0, 0);   // teto regular
-    SapoInvocacao[playerid][sapoObjs][6] = CreateObject(12044, x, y-3.0, z+3.0, 90, 0, 0);   // teto regular
-    SapoInvocacao[playerid][sapoObjs][8] = CreateObject(12044, x, y, z-3.0, 90, 0, 0);   // ch?o
-
-    // Fuma?a
-    new obj = CreateObject(18682, x, y, z-5.5, 0, 0, 0);
-    SetTimerEx("DestroyObject", 5000, false, "d", obj);
-
-
-
-    // Marcar ativo
-    SapoInvocacao[playerid][sapoAtivo] = 1;
-
-    // Timer de auto-destrui??o
-    TimerSapo[playerid] = SetTimerEx("TimerDesativarSapo", SAPO_TIMING, false, "i", playerid);
-    return 1;
-}
-
-stock DesativarSapoInvocacao(playerid, bool:manual)
-{
-    if(!SapoInvocacao[playerid][sapoAtivo]) return 0;
-
-    DestroyObject(SapoInvocacao[playerid][sapoObj]);
-    for(new i=0; i<9; i++)
-    {
-        if(SapoInvocacao[playerid][sapoObjs][i])
-        {
-            DestroyObject(SapoInvocacao[playerid][sapoObjs][i]);
-            SapoInvocacao[playerid][sapoObjs][i] = 0;
-        }
-    }
-
-    KillTimer(TimerSapo[playerid]);
-
-    new Float:x, Float:y, Float:z, Float:a;
-    GetPlayerFacingAngle(playerid, a);
-    GetPlayerPos(playerid, x, y, z);
-    GetXYInFrontOfPlayer(playerid, x, y, 9.0);
-
-    SapoInvocacao[playerid][sapoAtivo] = 0;
-    new obj = CreateObject(18682, x, y, z-5.5, 0, 0, 0);
-    SetTimerEx("DestroyObject", 5000, false, "d", obj);
-
-    //CreateObject(18683, x, y, z-5.5, 0, 0, 0);
-
-
-    return 1;
-}
-
-public TimerDesativarSapo(playerid)
-{
-    return DesativarSapoInvocacao(playerid, false);
-
-    new Float:x, Float:y, Float:z, Float:a;
-    GetPlayerFacingAngle(playerid, a);
-    GetPlayerPos(playerid, x, y, z);
-    GetXYInFrontOfPlayer(playerid, x, y, 9.0);
-    new obj = CreateObject(18682, x, y, z-5.5, 0, 0, 0);
-    SetTimerEx("DestroyObject", 5000, false, "d", obj);
-
-    //CreateObject(18683, x, y, z-5.5, 0, 0, 0);
-
-    return 1;
-}
-
-function SapoInvocacaoSay(playerid)
-{
-    new str[128];
-    format(str, sizeof(str), "%s (%d): Jutsu de Invoca??o: Pris?o Do Sapo Guardi?o!", PlayerNameDados(playerid), playerid);
-    SendMessageProx(playerid, 25.0, str, COLOR_FADE1,COLOR_FADE2,COLOR_FADE3,COLOR_FADE4,COLOR_FADE5);
-    return 1;
-}
 
 
 
@@ -79156,6 +77429,7 @@ CMD:bugado(playerid, params[])
 #include "Includes\Jutsus\cmd_hotbar.pwn"
 #include "Includes\Jutsus\Selos.pwn"
 #include "Includes\Mundo\fama.pwn"
+#include "Includes\Jutsus\invocacaosapo.pwn"
 
 
 // === Sistema de Direito Clicado
@@ -79231,64 +77505,7 @@ CMD:pos(playerid, params[])
     return 1;
 }
 
-/*stock SalvarMarcadosHiraishin(playerid)
-{
-    new playername[MAX_PLAYER_NAME];
-    new file[128], key[64];
 
-    GetPlayerName(playerid, playername, sizeof(playername));
-    format(file, sizeof(file), "%s%s.ini", PASTA_HIRAISHIN, playername);
-
-    // Cria arquivo caso n?o exista
-    if(!DOF2_FileExists(file))
-        DOF2_CreateFile(file);
-
-    // Salva os 10 slots
-    for(new x = 0; x < 10; x++)
-    {
-        format(key, sizeof(key), "pNome%d", x);
-        DOF2_SetString(file, key, MarcasHiraishin[playerid][pNome][x]);
-    }
-
-    DOF2_SaveFile(file);
-
-    return 1;
-}
-
-stock CarregarMarcadosHiraishin(playerid)
-{
-    new playername[MAX_PLAYER_NAME];
-    new file[128], key[64];
-
-    GetPlayerName(playerid, playername, sizeof(playername));
-    format(file, sizeof(file), "%s%s.ini", PASTA_HIRAISHIN, playername);
-
-    // Se n?o existir arquivo, n?o faz nada
-    if(!DOF2_FileExists(file))
-        return 0;
-
-    // Carrega os 10 slots
-    for(new x = 0; x < 10; x++)
-    {
-        format(key, sizeof(key), "pNome%d", x);
-        DOF2_GetString(file, key, MarcasHiraishin[playerid][pNome][x], sizeof(MarcasHiraishin[playerid][pNome][x]));
-    }
-
-    return 1;
-}
-
-stock GetPlayerIdByName(const nome[])
-{
-    new playername[MAX_PLAYER_NAME];
-    for(new i = 0; i < MAX_PLAYERS; i++)
-    {
-        if(!IsPlayerConnected(i)) continue;
-        GetPlayerName(i, playername, sizeof(playername));
-        if(strcmp(playername, nome, true) == 0) // true = case-insensitive
-            return i;
-    }
-    return INVALID_PLAYER_ID;
-}*/
 
 // Kirin - inicio
 new kirinObject[MAX_PLAYERS];
@@ -79522,3 +77739,331 @@ public FimTornado(playerid)
 #include "Includes\Mundo\nnrp_msb_cooldowns.pwn"
 
 #include "Includes\Faccoes\shrp_guerra.pwn"
+
+// =========================
+// Missoes (refactor)
+// =========================
+
+
+// ==========================================================
+// Missoes (Kage/Vila) - PlayerTextDraws legacy
+// Criado SOB DEMANDA para economizar PTD e nao quebrar a HUD.
+// ==========================================================
+stock MissoesLegacyUI_Reset(playerid)
+{
+    for(new i = 0; i < 9; i++)  MissoesVilaTXD[playerid][i] = PlayerText:INVALID_TEXT_DRAW;
+    for(new i = 0; i < 12; i++) FinalizarMissao[playerid][i] = PlayerText:INVALID_TEXT_DRAW;
+    return 1;
+}
+
+stock MissoesLegacyUI_CreatePlayerTextDraws(playerid)
+{
+    if(MissoesVilaTXD[playerid][0] != PlayerText:INVALID_TEXT_DRAW) return 1;
+    //==== Inicio TextDraw Missoes Kage e Vila ====//
+        MissoesVilaTXD[playerid][0] = CreatePlayerTextDraw(playerid, 36.000000, 23.000000, "Missao:Pegar");
+        PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][0], 4);
+        PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][0], 0.600000, 2.000000);
+        PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][0], 580.500000, 430.000000);
+        PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][0], 1);
+        PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][0], 0);
+        PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][0], 1);
+        PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][0], -1);
+        PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][0], 255);
+        PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][0], 50);
+        PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][0], 1);
+        PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][0], 1);
+        PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][0], 0);
+
+        MissoesVilaTXD[playerid][1] = CreatePlayerTextDraw(playerid, 312.000000, 170.000000, "Missao:Nome");
+        PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][1], 1);
+        PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][1], 0.287499, 1.150000);
+        PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][1], 537.000000, 412.500000);
+        PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][1], 1);
+        PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][1], 0);
+        PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][1], 2);
+        PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][1], -1);
+        PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][1], 0);
+        PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][1], 1);
+        PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][1], 1);
+        PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][1], 1);
+        PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][1], 0);
+
+        MissoesVilaTXD[playerid][2] = CreatePlayerTextDraw(playerid, 317.000000, 197.000000, "MissaoDescricao");
+        PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][2], 1);
+        PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][2], 0.270833, 1.150000);
+        PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][2], 197.000000, 120.000000);
+        PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][2], 1);
+        PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][2], 0);
+        PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][2], 2);
+        PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][2], -1);
+        PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][2], 0);
+        PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][2], 0);
+        PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][2], 1);
+        PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][2], 1);
+        PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][2], 0);
+
+        MissoesVilaTXD[playerid][3] = CreatePlayerTextDraw(playerid, 247.000000, 319.000000, "Invent:BotaoP");
+        PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][3], 4);
+        PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][3], 0.600000, 2.000000);
+        PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][3], 74.500000, 34.000000);
+        PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][3], 1);
+        PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][3], 0);
+        PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][3], 1);
+        PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][3], -1);
+        PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][3], 255);
+        PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][3], 50);
+        PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][3], 1);
+        PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][3], 1);
+        PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][3], 0);
+
+        MissoesVilaTXD[playerid][4] = CreatePlayerTextDraw(playerid, 337.000000, 319.000000, "Invent:BotaoPP");
+        PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][4], 4);
+        PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][4], 0.600000, 2.000000);
+        PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][4], 74.500000, 34.000000);
+        PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][4], 1);
+        PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][4], 0);
+        PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][4], 1);
+        PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][4], -1);
+        PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][4], 255);
+        PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][4], 50);
+        PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][4], 1);
+        PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][4], 1);
+        PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][4], 0);
+
+        MissoesVilaTXD[playerid][5] = CreatePlayerTextDraw(playerid, 292.000000, 331.000000, "Aceitar");
+        PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][5], 1);
+        PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][5], 0.262500, 1.499999);
+        PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][5], 10.500000, 44.000000);
+        PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][5], 1);
+        PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][5], 4);
+        PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][5], 2);
+        PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][5], -1);
+        PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][5], 65);
+        PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][5], 0);
+        PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][5], 1);
+        PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][5], 1);
+        PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][5], 1);
+
+        MissoesVilaTXD[playerid][6] = CreatePlayerTextDraw(playerid, 368.000000, 331.000000, "Recusar");
+        PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][6], 1);
+        PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][6], 0.245833, 1.549999);
+        PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][6], 10.500000, 44.000000);
+        PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][6], 1);
+        PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][6], 4);
+        PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][6], 2);
+        PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][6], -1);
+        PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][6], 65);
+        PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][6], 0);
+        PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][6], 1);
+        PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][6], 1);
+        PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][6], 1);
+
+        MissoesVilaTXD[playerid][7] = CreatePlayerTextDraw(playerid, 282.000000, 275.000000, "MRYO");
+        PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][7], 1);
+        PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][7], 0.287499, 1.149999);
+        PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][7], 537.000000, 412.500000);
+        PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][7], 1);
+        PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][7], 0);
+        PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][7], 2);
+        PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][7], -1);
+        PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][7], 0);
+        PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][7], 1);
+        PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][7], 1);
+        PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][7], 1);
+        PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][7], 0);
+
+        MissoesVilaTXD[playerid][8] = CreatePlayerTextDraw(playerid, 289.000000, 295.000000, "MXP");
+        PlayerTextDrawFont(playerid, MissoesVilaTXD[playerid][8], 1);
+        PlayerTextDrawLetterSize(playerid, MissoesVilaTXD[playerid][8], 0.287499, 1.149999);
+        PlayerTextDrawTextSize(playerid, MissoesVilaTXD[playerid][8], 537.000000, 412.500000);
+        PlayerTextDrawSetOutline(playerid, MissoesVilaTXD[playerid][8], 1);
+        PlayerTextDrawSetShadow(playerid, MissoesVilaTXD[playerid][8], 0);
+        PlayerTextDrawAlignment(playerid, MissoesVilaTXD[playerid][8], 2);
+        PlayerTextDrawColor(playerid, MissoesVilaTXD[playerid][8], -1);
+        PlayerTextDrawBackgroundColor(playerid, MissoesVilaTXD[playerid][8], 0);
+        PlayerTextDrawBoxColor(playerid, MissoesVilaTXD[playerid][8], 1);
+        PlayerTextDrawUseBox(playerid, MissoesVilaTXD[playerid][8], 1);
+        PlayerTextDrawSetProportional(playerid, MissoesVilaTXD[playerid][8], 1);
+        PlayerTextDrawSetSelectable(playerid, MissoesVilaTXD[playerid][8], 0);
+        //== Finalizar Missoes TXD
+        FinalizarMissao[playerid][0] = CreatePlayerTextDraw(playerid, 303.000000, 21.000000, "Invent:Sucesso");
+        PlayerTextDrawFont(playerid, FinalizarMissao[playerid][0], 4);
+        PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][0], 0.600000, 2.000000);
+        PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][0], 510.000000, 395.000000);
+        PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][0], 1);
+        PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][0], 0);
+        PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][0], 1);
+        PlayerTextDrawColor(playerid, FinalizarMissao[playerid][0], -1);
+        PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][0], 255);
+        PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][0], 50);
+        PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][0], 1);
+        PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][0], 1);
+        PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][0], 0);
+
+        FinalizarMissao[playerid][1] = CreatePlayerTextDraw(playerid, -1.000000, 0.000000, "Missao:Completa");
+        PlayerTextDrawFont(playerid, FinalizarMissao[playerid][1], 4);
+        PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][1], 0.600000, 2.000000);
+        PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][1], 643.500000, 451.000000);
+        PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][1], 1);
+        PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][1], 0);
+        PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][1], 1);
+        PlayerTextDrawColor(playerid, FinalizarMissao[playerid][1], -1);
+        PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][1], 255);
+        PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][1], 50);
+        PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][1], 1);
+        PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][1], 1);
+        PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][1], 0);
+
+        FinalizarMissao[playerid][2] = CreatePlayerTextDraw(playerid, 77.000000, 164.000000, "ranks:A");
+        PlayerTextDrawFont(playerid, FinalizarMissao[playerid][2], 4);
+        PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][2], 0.600000, 2.000000);
+        PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][2], 286.500000, 215.500000);
+        PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][2], 1);
+        PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][2], 0);
+        PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][2], 1);
+        PlayerTextDrawColor(playerid, FinalizarMissao[playerid][2], -1);
+        PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][2], 255);
+        PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][2], 50);
+        PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][2], 1);
+        PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][2], 1);
+        PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][2], 0);
+
+        FinalizarMissao[playerid][3] = CreatePlayerTextDraw(playerid, 77.000000, 164.000000, "ranks:B");
+        PlayerTextDrawFont(playerid, FinalizarMissao[playerid][3], 4);
+        PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][3], 0.600000, 2.000000);
+        PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][3], 286.500000, 215.500000);
+        PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][3], 1);
+        PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][3], 0);
+        PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][3], 1);
+        PlayerTextDrawColor(playerid, FinalizarMissao[playerid][3], -1);
+        PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][3], 255);
+        PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][3], 50);
+        PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][3], 1);
+        PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][3], 1);
+        PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][3], 0);
+
+        FinalizarMissao[playerid][4] = CreatePlayerTextDraw(playerid, 77.000000, 164.000000, "ranks:C");
+        PlayerTextDrawFont(playerid, FinalizarMissao[playerid][4], 4);
+        PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][4], 0.600000, 2.000000);
+        PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][4], 286.500000, 215.500000);
+        PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][4], 1);
+        PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][4], 0);
+        PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][4], 1);
+        PlayerTextDrawColor(playerid, FinalizarMissao[playerid][4], -1);
+        PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][4], 255);
+        PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][4], 50);
+        PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][4], 1);
+        PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][4], 1);
+        PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][4], 0);
+
+        FinalizarMissao[playerid][5] = CreatePlayerTextDraw(playerid, 77.000000, 164.000000, "ranks:D");
+        PlayerTextDrawFont(playerid, FinalizarMissao[playerid][5], 4);
+        PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][5], 0.600000, 2.000000);
+        PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][5], 286.500000, 215.500000);
+        PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][5], 1);
+        PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][5], 0);
+        PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][5], 1);
+        PlayerTextDrawColor(playerid, FinalizarMissao[playerid][5], -1);
+        PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][5], 255);
+        PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][5], 50);
+        PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][5], 1);
+        PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][5], 1);
+        PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][5], 0);
+
+        FinalizarMissao[playerid][6] = CreatePlayerTextDraw(playerid, 77.000000, 164.000000, "ranks:S");
+        PlayerTextDrawFont(playerid, FinalizarMissao[playerid][6], 4);
+        PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][6], 0.600000, 2.000000);
+        PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][6], 286.500000, 215.500000);
+        PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][6], 1);
+        PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][6], 0);
+        PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][6], 1);
+        PlayerTextDrawColor(playerid, FinalizarMissao[playerid][6], -1);
+        PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][6], 255);
+        PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][6], 50);
+        PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][6], 1);
+        PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][6], 1);
+        PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][6], 0);
+
+        FinalizarMissao[playerid][7] = CreatePlayerTextDraw(playerid, 380.000000, 57.000000, "ranks:Carimbo");
+        PlayerTextDrawFont(playerid, FinalizarMissao[playerid][7], 4);
+        PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][7], 0.600000, 2.000000);
+        PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][7], 75.000000, 63.000000);
+        PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][7], 1);
+        PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][7], 0);
+        PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][7], 1);
+        PlayerTextDrawColor(playerid, FinalizarMissao[playerid][7], -1);
+        PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][7], 255);
+        PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][7], 50);
+        PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][7], 1);
+        PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][7], 1);
+        PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][7], 0);
+
+        FinalizarMissao[playerid][8] = CreatePlayerTextDraw(playerid, 548.000000, 275.000000, "RGM1");
+        PlayerTextDrawFont(playerid, FinalizarMissao[playerid][8], 2);
+        PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][8], 0.562500, 2.149999);
+        PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][8], 400.000000, 17.000000);
+        PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][8], 1);
+        PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][8], 0);
+        PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][8], 2);
+        PlayerTextDrawColor(playerid, FinalizarMissao[playerid][8], -1);
+        PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][8], 255);
+        PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][8], 0);
+        PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][8], 1);
+        PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][8], 1);
+        PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][8], 0);
+
+        FinalizarMissao[playerid][9] = CreatePlayerTextDraw(playerid, 548.000000, 314.000000, "XPG0");
+        PlayerTextDrawFont(playerid, FinalizarMissao[playerid][9], 2);
+        PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][9], 0.562500, 2.149999);
+        PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][9], 400.000000, 17.000000);
+        PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][9], 1);
+        PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][9], 0);
+        PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][9], 2);
+        PlayerTextDrawColor(playerid, FinalizarMissao[playerid][9], -1);
+        PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][9], 255);
+        PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][9], 0);
+        PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][9], 1);
+        PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][9], 1);
+        PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][9], 0);
+
+        FinalizarMissao[playerid][10] = CreatePlayerTextDraw(playerid, 548.000000, 350.000000, "XPG1");
+        PlayerTextDrawFont(playerid, FinalizarMissao[playerid][10], 2);
+        PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][10], 0.562500, 2.149999);
+        PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][10], 400.000000, 17.000000);
+        PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][10], 1);
+        PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][10], 0);
+        PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][10], 2);
+        PlayerTextDrawColor(playerid, FinalizarMissao[playerid][10], -1);
+        PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][10], 255);
+        PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][10], 0);
+        PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][10], 1);
+        PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][10], 1);
+        PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][10], 0);
+
+        FinalizarMissao[playerid][11] = CreatePlayerTextDraw(playerid, 169.000000, 17.000000, "RGM0");
+        PlayerTextDrawFont(playerid, FinalizarMissao[playerid][11], 2);
+        PlayerTextDrawLetterSize(playerid, FinalizarMissao[playerid][11], 0.387500, 2.099999);
+        PlayerTextDrawTextSize(playerid, FinalizarMissao[playerid][11], 400.000000, 17.000000);
+        PlayerTextDrawSetOutline(playerid, FinalizarMissao[playerid][11], 1);
+        PlayerTextDrawSetShadow(playerid, FinalizarMissao[playerid][11], 0);
+        PlayerTextDrawAlignment(playerid, FinalizarMissao[playerid][11], 2);
+        PlayerTextDrawColor(playerid, FinalizarMissao[playerid][11], -1);
+        PlayerTextDrawBackgroundColor(playerid, FinalizarMissao[playerid][11], 255);
+        PlayerTextDrawBoxColor(playerid, FinalizarMissao[playerid][11], 0);
+        PlayerTextDrawUseBox(playerid, FinalizarMissao[playerid][11], 1);
+        PlayerTextDrawSetProportional(playerid, FinalizarMissao[playerid][11], 1);
+        PlayerTextDrawSetSelectable(playerid, FinalizarMissao[playerid][11], 0);
+        //==== Final TextDraw Missoes Kage e Vila ====//
+    return 1;
+}
+
+stock MissoesLegacyUI_Ensure(playerid)
+{
+    if(MissoesVilaTXD[playerid][0] == PlayerText:INVALID_TEXT_DRAW) MissoesLegacyUI_CreatePlayerTextDraws(playerid);
+    return 1;
+}
+
+#include "Includes\Missoes\shrp_missoes_all.pwn"
+#include "Includes\Missoes\diarias_rank_cfg.pwn"
+#include "Includes\Missoes\diarias_rank_txd.pwn"
+

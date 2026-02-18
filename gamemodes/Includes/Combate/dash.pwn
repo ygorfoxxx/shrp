@@ -3,6 +3,10 @@
 #endif
 #define _NNRP_DASH_
 
+#if !defined QUEBRACOMBO_COOLDOWN
+    #define QUEBRACOMBO_COOLDOWN 40
+#endif
+
 // ==========================================================
 //  NNRP - Sistema de Dash (extra?do do gamemode)
 //  Arquivo: dash.pwn (ANSI)
@@ -597,29 +601,39 @@ stock DashCol_OnPlayerHit(playerid, targetid)
 
     if(GetPVarInt(targetid, "Defensa"))
     {
-        DeletePVar(targetid, "Defensa");
+        // DEFENSA no timing: cancela o HIT do Rapid Dash
+        // - sem chute autom?co
+        // - sem quebrar defesa do defensor
+        // - sem stun no defensor (ele pode contra-atacar manualmente)
         AudioInPlayer(targetid, 30.0, 108);
+
         DashFrenteON[playerid] = 3;
         DashUsado[playerid] = 0;
         DashUsado[targetid] = 0;
-        ImpossibleDefesa[targetid] = 1;
-        PCarregandoChakra(targetid);
 
         RapidDash_SnapToTarget(playerid, targetid);
         SetPlayerToFacePlayer(playerid, targetid);
-        HitCountCombos(playerid);
         if(EntrouArenaPvP[targetid] == 1){LastHitArenaPvP(playerid, targetid);}
 
-        if(!DefesaH[targetid][defesaDashTimer])
+        // Quebra-combo (empurr?PEQUENO) s? o cooldown estiver livre (40s)
+        new qc = GetPVarInt(targetid, "QC_CD");
+        if(qc <= 0 || qc <= gettime())
         {
-            DefesaH[targetid][defesaHitDash] = 1;
-            DefesaH[targetid][defesaDashTimer] = gettime() + DASHDEFESA_COOLDOWN;
-            ChuteForteD(targetid, playerid);
-            TimerQuebraDefesa[targetid] = SetTimerEx("QuebraDefesaAgain", 850, false, "d", targetid);
-        }
-        else
-        {
-            TimerQuebraDefesa[targetid] = SetTimerEx("QuebraDefesaAgain", 850, false, "d", targetid);
+            // empurra s? pouco o agressor para dar espa?ao defensor
+            new Float:ax, Float:ay, Float:az;
+            new Float:dx, Float:dy, Float:dz;
+            GetPlayerPos(playerid, ax, ay, az);
+            GetPlayerPos(targetid, dx, dy, dz);
+
+            new Float:vx = (ax - dx);
+            new Float:vy = (ay - dy);
+            new Float:len = floatsqroot(vx*vx + vy*vy);
+            if(len < 0.001) len = 0.001;
+            vx = (vx / len) * 0.20;
+            vy = (vy / len) * 0.20;
+            SetPlayerVelocity(playerid, vx, vy, 0.05);
+
+            SetPVarInt(targetid, "QC_CD", gettime() + QUEBRACOMBO_COOLDOWN);
         }
         return 1;
     }
@@ -722,17 +736,40 @@ function DashCurto(playerid)
                 if(Izanagi[i][IzanagiAtivado]){
                     SetTimerEx("IzanagiVoltar", 100, false, "d", i);
                 }else{
-                    if(GetPVarInt(i, "Defensa")){
-                        DeletePVar(i, "Defensa");
+                    if(GetPVarInt(i, "Defensa"))
+                    {
+                        // DEFENSA no timing: cancela o HIT / inicia? do combo a?o
+                        // - sem chute autom?co
+                        // - sem quebrar defesa do defensor
+                        // - sem stun no defensor
                         AudioInPlayer(i, 30.0, 108);
+
                         AirComboIniciou[playerid] = 3;
-                        ImpossibleDefesa[i] = 1;
-                        PCarregandoChakra(i);
+                        DashUsado[i] = 0;
+
                         SetPlayerBehindPlayer(playerid, i);
                         SetPlayerToFacePlayer(playerid, i);
-                        HitCountCombos(playerid);
                         if(EntrouArenaPvP[i] == 1){LastHitArenaPvP(playerid, i);}
-                        TimerQuebraDefesa[i] = SetTimerEx("QuebraDefesaAgain", 850, false, "d", i);
+
+                        // Quebra-combo (empurr?PEQUENO) s? o cooldown estiver livre (40s)
+                        new qc = GetPVarInt(i, "QC_CD");
+                        if(qc <= 0 || qc <= gettime())
+                        {
+                            new Float:ax, Float:ay, Float:az;
+                            new Float:dx, Float:dy, Float:dz;
+                            GetPlayerPos(playerid, ax, ay, az);
+                            GetPlayerPos(i, dx, dy, dz);
+
+                            new Float:vx = (ax - dx);
+                            new Float:vy = (ay - dy);
+                            new Float:len = floatsqroot(vx*vx + vy*vy);
+                            if(len < 0.001) len = 0.001;
+                            vx = (vx / len) * 0.20;
+                            vy = (vy / len) * 0.20;
+                            SetPlayerVelocity(playerid, vx, vy, 0.05);
+
+                            SetPVarInt(i, "QC_CD", gettime() + QUEBRACOMBO_COOLDOWN);
+                        }
                         break;
                     }else{
                         if(EntrouArenaPvP[i] == 1){LastHitArenaPvP(playerid, i);}

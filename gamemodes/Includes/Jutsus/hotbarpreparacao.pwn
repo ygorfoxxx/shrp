@@ -196,9 +196,19 @@ enum eJutsuId
     JID_MODO_RATO,
     JID_MODO_DRAGAO,
     JID_RAIJIN_VOADOR,
+	
+	//
+	JID_SAPO_PRISAO, //jutsu invocacao sapo
 
     // Cl?
-    JID_CLAN_TIGRE
+    JID_CLAN_TIGRE,
+	
+	//HYUGA KAITEN
+	JID_HAKKESHOU,
+
+	// Hyuuga
+	JID_BYAKUGAN
+
 };
 
 #if !defined JID_CLA_TIGRE
@@ -726,6 +736,23 @@ stock Jutsu_CastByID(playerid, eJutsuId:jutsuId)
 
         case JID_RAIJIN_VOADOR:  return RaijinVoador(playerid);
 
+
+		 case JID_SAPO_PRISAO:    return SapoInvocacaoJutsu(playerid); //jutsu invocacao sapo
+		
+			//KAITEN HYUGA
+		case JID_HAKKESHOU:
+{
+    if(Info[playerid][pClan] != CLAN_HYUUGA || Info[playerid][pClanNivel] < 2) return 1;
+    return JutsuHakkeshou(playerid);
+}
+
+		
+		case JID_BYAKUGAN:
+{
+    if(Info[playerid][pClan] != CLAN_HYUUGA || Info[playerid][pClanNivel] < 1) return 1;
+    return ByakuganJutsu(playerid);
+}
+
         case JID_CLAN_TIGRE:
         {
             if (Info[playerid][pClan] == 1) return JutsuTsutenkyakuu(playerid);
@@ -741,6 +768,8 @@ stock Jutsu_CastByID(playerid, eJutsuId:jutsuId)
 
             if (Info[playerid][pClan] == 5) return ColocarKunaiChao(playerid);
             if (Info[playerid][pClan] == 6) return JutsuRasengan(playerid);
+			
+			
             return 1;
         }
     }
@@ -805,6 +834,8 @@ static const gDefaultSelos[][] =
     "Rato, ",
     "Drag?o, ",
     "Coelho, Tigre, "
+	
+	
 };
 
 static const eJutsuId:gDefaultJutsuId[] =
@@ -895,6 +926,13 @@ stock Jutsu_PlayerTemAcessoEspecial(playerid, eJutsuId:jutsuId)
     if (jutsuId == JID_RAIJIN_VOADOR)    return (Info[playerid][pClan] == 5);
 
     if (jutsuId == JID_CLAN_TIGRE)       return (Info[playerid][pClan] != 0);
+
+	//jutsu invocação do sapo
+	if (jutsuId == JID_SAPO_PRISAO)	   return (Info[playerid][pRank] >= 3 && Info[playerid][pSenin] > 0);
+
+	//KAITEN HYUGA
+	if (jutsuId == JID_HAKKESHOU) return (Info[playerid][pClan] == 4);
+
 
     return 0;
 }
@@ -1050,6 +1088,9 @@ stock Jutsu_GetNomeById(eJutsuId:jutsuId, out[], outSize)
         case JID_MODO_DRAGAO:      format(out, outSize, "Modo: Drag?o");
         case JID_RAIJIN_VOADOR:    format(out, outSize, "Hiraishin: Raijin Voador");
 
+		//KAITEN HYUUGA
+		case JID_HAKKESHOU:		format(out, outSize, "Hyuuga: Hakkeshou Kaiten no Jutsu");
+
         case JID_CLAN_TIGRE:       format(out, outSize, "Cl?: Jutsu do cl?");
         default:                   format(out, outSize, "Jutsu %d", _:jutsuId);
     }
@@ -1090,7 +1131,8 @@ stock Jutsu_AppendCategoria(playerid, list[], listSize, const titulo[], especial
             else if(jid == JID_BARREIRA_TOGGLE) grp = 3;
             else if(jid == JID_BASE_ORO || jid == JID_BASE_AKA) grp = 4;
             else if(jid == JID_MODO_RATO || jid == JID_MODO_DRAGAO || jid == JID_RAIJIN_VOADOR) grp = 5;
-            else if(jid == JID_CLAN_TIGRE) grp = 6;
+            else if(jid == JID_CLAN_TIGRE || jid == JID_HAKKESHOU) grp = 6;
+
 
             if(grp != categoria) continue;
         }

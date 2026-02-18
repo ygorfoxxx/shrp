@@ -34,6 +34,9 @@
 #define DLG_MENUNPC_SET_HP        (24506)
 #define DLG_MENUNPC_XP_LIST       (24507)
 #define DLG_MENUNPC_XP_SET        (24508)
+#define DLG_MENUNPC_EDITJUTSU_LIST (24509)
+#define DLG_MENUNPC_SET_ELEM       (24510)
+#define DLG_MENUNPC_SET_JLVL       (24511)
 
 #define DLG_MENUNPC_BUN_LIST     (6612)
 #define DLG_MENUNPC_BUN_SET      (6613)
@@ -66,6 +69,8 @@ enum E_MN_SPAWN
     mnRespawnMs,
     mnCost,                 // usado em guardas do tesouro
     mnXPOverride,            // -1 = usa template; >=0 = override de XP do spawn
+    mnElem,
+    mnJutsuLvl,
     Float:mnX,
     Float:mnY,
     Float:mnZ,
@@ -91,6 +96,14 @@ new gMnXpEditIdx[MAX_PLAYERS];
 // pendência de criação (skin)
 new gMnPendingSkinIdx[MAX_PLAYERS];
 new bool:gMnPendingSkinIsGuard[MAX_PLAYERS];
+
+// pendência de Elemento/Jutsu (selos) - usado na criação/edição
+new gMnPendingJutsuIdx[MAX_PLAYERS];     // spawnid selecionado
+new gMnPendingJutsuMode[MAX_PLAYERS];    // 1 = criacao, 2 = edicao
+
+// lista para editar elemento/jutsu
+new gMnEditJutsuMap[MAX_PLAYERS][MENUNPC_MAX_SPAWNS];
+new gMnEditJutsuCount[MAX_PLAYERS];
 
 // -------------------- CLONES --------------------
 new gBunshinSlots[MAX_PLAYERS][BUNSHIN_MAX_CLONES];
@@ -119,6 +132,7 @@ new gMnBunTarget[MAX_PLAYERS];
 // -------------------- ACCESS (AJUSTE AQUI) --------------------
 stock bool:MenuNpc_CanUse(playerid)
 {
+    #pragma unused playerid
     // Sugestão: restringir pra staff.
     // Ex.: return (Info[playerid][pAdmin] >= 1);
     return true;
@@ -173,6 +187,8 @@ stock Mn_ResetSpawn(i)
     gMnSpawn[i][mnRespawnMs] = 0;
     gMnSpawn[i][mnCost] = 0;
     gMnSpawn[i][mnXPOverride] = -1;
+    gMnSpawn[i][mnElem] = NPC_ELEM_NONE;
+    gMnSpawn[i][mnJutsuLvl] = 0;
     gMnSpawn[i][mnX] = 0.0;
     gMnSpawn[i][mnY] = 0.0;
     gMnSpawn[i][mnZ] = 0.0;
@@ -260,6 +276,8 @@ stock Mn_ApplyGuardTemplate(slot, tpl)
 }
 
 // -------------------- SPAWN/RESPAWN --------------------
+stock Mn_ApplyJutsuToAliveNpc(spawnid);
+
 stock Mn_SpawnNow(i)
 {
     if(!gMnSpawn[i][mnUsed]) return 0;
@@ -301,7 +319,11 @@ stock Mn_SpawnNow(i)
         gNpcXPReward[slot] = gMnSpawn[i][mnXPOverride];
     }
 
-    return 1;
+    
+    // Aplica Elemento/Nivel de jutsu (selos) se configurado
+    Mn_ApplyJutsuToAliveNpc(i);
+
+return 1;
 }
 
 forward Mn_Tick();
@@ -356,6 +378,9 @@ stock MenuNpc_Init()
         gMnXpListCount[p] = 0;
         gMnPendingSkinIdx[p] = -1;
         gMnPendingSkinIsGuard[p] = false;
+        gMnPendingJutsuIdx[p] = -1;
+        gMnPendingJutsuMode[p] = 0;
+        gMnEditJutsuCount[p] = 0;
 
         for(new c=0; c<BUNSHIN_MAX_CLONES; c++) gBunshinSlots[p][c] = -1;
         gBunshinExpireTick[p] = 0;
@@ -506,6 +531,126 @@ stock MenuNpc_ShowSpawnList(playerid)
 
     ShowPlayerDialog(playerid, DLG_MENUNPC_LIST, DIALOG_STYLE_TABLIST_HEADERS,
         "Spawns", list, "Selecionar", "Voltar");
+    return 1;
+}
+// -------------------- JUTSU/ELEMENTO (UI) --------------------
+// wrapper (compatibilidade com menus antigos)
+stock MenuNpc_ShowList(playerid)
+{
+    return MenuNpc_ShowSpawnList(playerid);
+}
+
+stock MenuNpc_ElemName(elem, out[], outSize)
+{
+    switch(elem)
+    {
+        case NPC_ELEM_KATON:  format(out, outSize, "Katon");
+        case NPC_ELEM_SUITON: format(out, outSize, "Suiton");
+        case NPC_ELEM_FUTON:  format(out, outSize, "Futon");
+        case NPC_ELEM_DOTON:  format(out, outSize, "Doton");
+        case NPC_ELEM_RAITON: format(out, outSize, "Raiton");
+        default:              format(out, outSize, "Nenhum");
+    }
+    return 1;
+}
+
+stock MenuNpc_ShowEditJutsuList(playerid)
+{
+    new list[2048];
+    list[0] = '\0';
+    strcat(list, "ID\tTipo\tElemento\tNivel\n", sizeof list);
+
+    gMnEditJutsuCount[playerid] = 0;
+
+    for(new i=0; i<MENUNPC_MAX_SPAWNS; i++)
+    {
+        if(!gMnSpawn[i][mnUsed]) continue;
+
+        new typeName[10];
+        if(gMnSpawn[i][mnType] == SPAWN_MOB) format(typeName, sizeof typeName, "MOB");
+        else format(typeName, sizeof typeName, "GUARDA");
+
+        new elemName[12];
+        MenuNpc_ElemName(gMnSpawn[i][mnElem], elemName, sizeof elemName);
+
+        new lvlName[8];
+        if(gMnSpawn[i][mnElem] == NPC_ELEM_NONE || gMnSpawn[i][mnJutsuLvl] <= 0) format(lvlName, sizeof lvlName, "OFF");
+        else format(lvlName, sizeof lvlName, "%d", gMnSpawn[i][mnJutsuLvl]);
+
+        new line[128];
+        format(line, sizeof line, "%d\t%s\t%s\t%s\n", i, typeName, elemName, lvlName);
+        strcat(list, line, sizeof list);
+
+        gMnEditJutsuMap[playerid][gMnEditJutsuCount[playerid]++] = i;
+        if(gMnEditJutsuCount[playerid] >= MENUNPC_MAX_SPAWNS) break;
+    }
+
+    if(gMnEditJutsuCount[playerid] == 0)
+        strcat(list, "\t(sem spawns)\t\t\n", sizeof list);
+
+    ShowPlayerDialog(playerid, DLG_MENUNPC_EDITJUTSU_LIST, DIALOG_STYLE_TABLIST_HEADERS,
+        "Editar Elemento/Jutsu", list, "Selecionar", "Voltar");
+    return 1;
+}
+
+stock MenuNpc_ShowSetElem(playerid)
+{
+    new idx = gMnPendingJutsuIdx[playerid];
+    new title[64];
+
+    if(idx >= 0 && idx < MENUNPC_MAX_SPAWNS && gMnSpawn[idx][mnUsed])
+    {
+        new elemName[12];
+        MenuNpc_ElemName(gMnSpawn[idx][mnElem], elemName, sizeof elemName);
+        format(title, sizeof title, "Elemento do NPC (atual: %s)", elemName);
+    }
+    else
+    {
+        format(title, sizeof title, "Elemento do NPC");
+    }
+
+    ShowPlayerDialog(playerid, DLG_MENUNPC_SET_ELEM, DIALOG_STYLE_LIST,
+        title,
+        "Nenhum\nKaton\nSuiton\nFuton\nDoton\nRaiton",
+        "OK", "Voltar");
+    return 1;
+}
+
+stock MenuNpc_ShowSetJutsuLvl(playerid)
+{
+    new idx = gMnPendingJutsuIdx[playerid];
+    new title[64];
+
+    if(idx >= 0 && idx < MENUNPC_MAX_SPAWNS && gMnSpawn[idx][mnUsed])
+    {
+        format(title, sizeof title, "Nivel maximo de Jutsu (atual: %d)", gMnSpawn[idx][mnJutsuLvl]);
+    }
+    else
+    {
+        format(title, sizeof title, "Nivel maximo de Jutsu");
+    }
+
+    ShowPlayerDialog(playerid, DLG_MENUNPC_SET_JLVL, DIALOG_STYLE_LIST,
+        title,
+        "Nivel 1\nNivel 2\nNivel 3",
+        "OK", "Voltar");
+    return 1;
+}
+
+// aplica config de elemento/nivel no NPC vivo (se estiver spawnado)
+stock Mn_ApplyJutsuToAliveNpc(spawnid)
+{
+    if(spawnid < 0 || spawnid >= MENUNPC_MAX_SPAWNS) return 0;
+    if(!gMnSpawn[spawnid][mnUsed]) return 0;
+
+    new slot = gMnSpawn[spawnid][mnActiveSlot];
+    if(!Mn_IsAliveSlot(slot)) return 1;
+
+    if(gMnSpawn[spawnid][mnElem] != NPC_ELEM_NONE && gMnSpawn[spawnid][mnJutsuLvl] > 0)
+        SHRP_NpcSetAutoJutsu(slot, gMnSpawn[spawnid][mnElem], gMnSpawn[spawnid][mnJutsuLvl], 4500);
+    else
+        SHRP_NpcDisableAutoJutsu(slot);
+
     return 1;
 }
 
@@ -699,14 +844,15 @@ stock MenuNpc_OnDialog(playerid, dialogid, response, listitem, inputtext[])
         {
             if(!response) return 1;
 
-            switch(listitem)
+                        switch(listitem)
             {
                 case 0: return MenuNpc_ShowMobTpl(playerid);
                 case 1: return MenuNpc_ShowGuardTpl(playerid);
                 case 2: return MenuNpc_ShowSpawnList(playerid);
-                case 3: return MenuNpc_ShowXpPanel(playerid);
-                case 4: return MenuNpc_ShowBunPanel(playerid);
-                case 5: return BandidoMenu_Start(playerid);
+                case 3: return MenuNpc_ShowEditJutsuList(playerid);
+                case 4: return MenuNpc_ShowXpPanel(playerid);
+                case 5: return MenuNpc_ShowBunPanel(playerid);
+                case 6: return BandidoMenu_Start(playerid);
             }
             return 1;
         }
@@ -876,16 +1022,105 @@ stock MenuNpc_OnDialog(playerid, dialogid, response, listitem, inputtext[])
             gMnSpawn[idx][mnHPMax] = hp;
             gMnSpawn[idx][mnPendingHP] = false;
 
-            Mn_SpawnNow(idx);
+            // Próximo passo: Elemento/Jutsu do NPC (selos)
+            gMnPendingJutsuIdx[playerid] = idx;
+            gMnPendingJutsuMode[playerid] = 1; // criacao
 
-            gMnPendingSkinIdx[playerid] = -1;
-            gMnPendingSkinIsGuard[playerid] = false;
-
-            SendClientMessage(playerid, -1, "NPC criado!");
-            return 1;
+            return MenuNpc_ShowSetElem(playerid);
         }
 
 
+
+
+        case DLG_MENUNPC_EDITJUTSU_LIST:
+        {
+            if(!response) return MenuNpc_ShowMain(playerid);
+
+            if(listitem < 0 || listitem >= gMnEditJutsuCount[playerid])
+                return MenuNpc_ShowMain(playerid);
+
+            new idx = gMnEditJutsuMap[playerid][listitem];
+            if(idx < 0 || idx >= MENUNPC_MAX_SPAWNS || !gMnSpawn[idx][mnUsed])
+                return MenuNpc_ShowMain(playerid);
+
+            gMnPendingJutsuIdx[playerid] = idx;
+            gMnPendingJutsuMode[playerid] = 2; // edicao
+            return MenuNpc_ShowSetElem(playerid);
+        }
+
+        case DLG_MENUNPC_SET_ELEM:
+        {
+            new idx = gMnPendingJutsuIdx[playerid];
+            if(idx < 0 || idx >= MENUNPC_MAX_SPAWNS || !gMnSpawn[idx][mnUsed])
+                return MenuNpc_ShowMain(playerid);
+
+            if(!response)
+            {
+                // Voltar
+                if(gMnPendingJutsuMode[playerid] == 2) return MenuNpc_ShowEditJutsuList(playerid);
+                return MenuNpc_ShowMain(playerid);
+            }
+
+            // 0..5 conforme lista: Nenhum, Katon, Suiton, Futon, Doton, Raiton
+            new elem = NPC_ELEM_NONE;
+            switch(listitem)
+            {
+                case 1: elem = NPC_ELEM_KATON;
+                case 2: elem = NPC_ELEM_SUITON;
+                case 3: elem = NPC_ELEM_FUTON;
+                case 4: elem = NPC_ELEM_DOTON;
+                case 5: elem = NPC_ELEM_RAITON;
+            }
+
+            gMnSpawn[idx][mnElem] = elem;
+
+            // Se escolheu "Nenhum", finaliza aqui (zera nivel)
+            if(elem == NPC_ELEM_NONE)
+            {
+                gMnSpawn[idx][mnJutsuLvl] = 0;
+
+                // garante spawn e aplica
+                Mn_SpawnNow(idx);
+                Mn_ApplyJutsuToAliveNpc(idx);
+
+                SendClientMessage(playerid, -1, "Elemento/Jutsu do NPC definido: Nenhum.");
+                if(gMnPendingJutsuMode[playerid] == 2) return MenuNpc_ShowEditJutsuList(playerid);
+                return MenuNpc_ShowMain(playerid);
+            }
+
+            // Próximo: nível máximo
+            return MenuNpc_ShowSetJutsuLvl(playerid);
+        }
+
+        case DLG_MENUNPC_SET_JLVL:
+        {
+            new idx = gMnPendingJutsuIdx[playerid];
+            if(idx < 0 || idx >= MENUNPC_MAX_SPAWNS || !gMnSpawn[idx][mnUsed])
+                return MenuNpc_ShowMain(playerid);
+
+            if(!response)
+            {
+                // Voltar para elemento
+                return MenuNpc_ShowSetElem(playerid);
+            }
+
+            new lvl = listitem + 1; // 1..3
+            if(lvl < 1) lvl = 1;
+            if(lvl > 3) lvl = 3;
+
+            gMnSpawn[idx][mnJutsuLvl] = lvl;
+
+            // garante spawn e aplica
+            Mn_SpawnNow(idx);
+            Mn_ApplyJutsuToAliveNpc(idx);
+
+            new msg[96];
+            format(msg, sizeof msg, "Elemento/Jutsu do NPC aplicado. Nivel maximo: %d.", lvl);
+            SendClientMessage(playerid, -1, msg);
+
+            if(gMnPendingJutsuMode[playerid] == 2) return MenuNpc_ShowEditJutsuList(playerid);
+            return MenuNpc_ShowMain(playerid);
+        }
 
         case DLG_MENUNPC_XP_LIST:
         {

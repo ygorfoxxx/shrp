@@ -18,6 +18,17 @@ native HTTP(index, type, const url[], const data[], const callback[]);
 #endif
 
 #include <FCNPC>
+// --- Selos/Jutsu (NPC) ---
+// Selos.pwn expe VerificarSelos(playerid, selos[]). Aqui s declaramos pra poder chamar.
+forward VerificarSelos(playerid, const selos[]);
+
+// Elementos para auto-jutsu (Selos)
+#define NPC_ELEM_NONE   (0)
+#define NPC_ELEM_KATON  (1)
+#define NPC_ELEM_SUITON (2)
+#define NPC_ELEM_FUTON  (3)
+#define NPC_ELEM_DOTON  (4)
+#define NPC_ELEM_RAITON (5)
 
 // Se voc tiver esses defines no seu GM, beleza. Se no, o include continua compilando.
 #if !defined EOS
@@ -92,6 +103,11 @@ new gNpcJutsuCmd[MAXIMO_NPCS_COMBATE][24]; // ex: "katon", "suiton"
 new bool:gNpcJutsuNeedsTarget[MAXIMO_NPCS_COMBATE];
 new gNpcJutsuCooldownMs[MAXIMO_NPCS_COMBATE];
 new gNpcLastJutsuTick[MAXIMO_NPCS_COMBATE];
+// Auto-jutsu por Selos (configurado via menunpc)
+new gNpcAutoElem[MAXIMO_NPCS_COMBATE];         // NPC_ELEM_*
+new gNpcAutoMaxLvl[MAXIMO_NPCS_COMBATE];       // 1..3 (usa niveis <= esse)
+new gNpcAutoCooldownMs[MAXIMO_NPCS_COMBATE];   // cooldown entre casts
+new gNpcLastAutoTick[MAXIMO_NPCS_COMBATE];     // tick do ultimo cast
 
 // -----------------------------
 // Helpers
@@ -173,7 +189,7 @@ public SHRP_NpcAI_RegisterExisting(npcid, npctype, vila, Float:x, Float:y, Float
     gNpcOwner[slot] = INVALID_PLAYER_ID;
     gNpcTarget[slot] = INVALID_PLAYER_ID;
     gNpcVila[slot] = vila;
-    // Bandana/Aliança: NPC herda a vila (label e lógica de facção)
+    // Bandana/Alian?a: NPC herda a vila (label e l?gica de fac??o)
     Info[npcid][pMember] = vila;
     if(funcidx("SistemaBandanaIDStatus") != -1) CallLocalFunction("SistemaBandanaIDStatus", "i", npcid);
     gNpcHome[slot][0] = x;
@@ -204,7 +220,7 @@ public SHRP_NpcAI_RegisterExisting(npcid, npctype, vila, Float:x, Float:y, Float
     // map reverse
     gNpcSlotByPlayer[npcid] = slot;
 
-    // Tag/Label (SistemaBandanaIDStatus) - habilitado por padrão; pode ser desligado (ex: bunshin sem nametag)
+    // Tag/Label (SistemaBandanaIDStatus) - habilitado por padr?o; pode ser desligado (ex: bunshin sem nametag)
     gNpcTagEnabled[slot] = true;
 
     // Garantir VW/Int do NPC
@@ -403,6 +419,10 @@ stock SHRP_NpcResetSlot(slot)
     gNpcJutsuNeedsTarget[slot] = false;
     gNpcJutsuCooldownMs[slot] = 5000;
     gNpcLastJutsuTick[slot] = 0;
+    gNpcAutoElem[slot] = NPC_ELEM_NONE;
+    gNpcAutoMaxLvl[slot] = 0;
+    gNpcAutoCooldownMs[slot] = 4500;
+    gNpcLastAutoTick[slot] = 0;
 }
 
 stock SHRP_NpcAllocSlot()
@@ -474,13 +494,13 @@ stock SHRP_NpcCreate(const name[], skin, type, vila, Float:x, Float:y, Float:z, 
     gNpcId[slot] = npcid;
     gNpcSlotByPlayer[npcid] = slot;
 
-    // Tag/Label (SistemaBandanaIDStatus) - habilitado por padrão; pode ser desligado (ex: bunshin sem nametag)
+    // Tag/Label (SistemaBandanaIDStatus) - habilitado por padr?o; pode ser desligado (ex: bunshin sem nametag)
     gNpcTagEnabled[slot] = true;
 
     // stats base (pra dano de taijutsu funcionar mesmo sem template)
     Info[npcid][pTaijutsu] = 50;
 
-    // Bandana/Aliança: NPC herda a vila para aparecer corretamente no SistemaBandanaIDStatus
+    // Bandana/Alian?a: NPC herda a vila para aparecer corretamente no SistemaBandanaIDStatus
     Info[npcid][pMember] = vila;
 
     // Garante que o label/tag seja criado mesmo se o OnPlayerConnect do NPC foi ignorado
@@ -578,7 +598,7 @@ stock SHRP_NpcSetOwner(slot, ownerid, Float:followDist = 2.5)
 
 // Habilita/Desabilita a nametag (label 3D) para este NPC.
 // - Quando desabilitado, o SistemaBandanaIDStatus vai ignorar esse NPC (via SHRP_NpcAI_IsCombatNPC_Public)
-// - Útil para Bunshin: same nome/vila, mas sem nametag se você quiser
+// - ?til para Bunshin: same nome/vila, mas sem nametag se voc? quiser
 stock SHRP_NpcSetTagEnabled(slot, bool:enable)
 {
     if (slot < 0 || slot >= MAXIMO_NPCS_COMBATE) return 0;
@@ -611,6 +631,114 @@ stock SHRP_NpcSetJutsu(slot, const cmdName[], bool:needsTarget = false, cooldown
     gNpcJutsuNeedsTarget[slot] = needsTarget;
     gNpcJutsuCooldownMs[slot] = (cooldownMs < 1000) ? 1000 : cooldownMs;
     gNpcLastJutsuTick[slot] = 0;
+    return 1;
+}
+// -----------------------------
+// API: Auto-jutsu via Selos (elemento + nvel)
+// -----------------------------
+stock SHRP_NpcSetAutoJutsu(slot, elem, maxLvl, cooldownMs = 4500)
+{
+    if(slot < 0 || slot >= MAXIMO_NPCS_COMBATE) return 0;
+    if(elem < NPC_ELEM_NONE || elem > NPC_ELEM_RAITON) elem = NPC_ELEM_NONE;
+
+    if(maxLvl < 1) maxLvl = 1;
+    if(maxLvl > 3) maxLvl = 3;
+
+    if(cooldownMs < 1000) cooldownMs = 1000;
+
+    gNpcAutoElem[slot] = elem;
+    gNpcAutoMaxLvl[slot] = (elem == NPC_ELEM_NONE) ? 0 : maxLvl;
+    gNpcAutoCooldownMs[slot] = cooldownMs;
+    gNpcLastAutoTick[slot] = 0;
+
+    return 1;
+}
+
+stock SHRP_NpcDisableAutoJutsu(slot)
+{
+    if(slot < 0 || slot >= MAXIMO_NPCS_COMBATE) return 0;
+    gNpcAutoElem[slot] = NPC_ELEM_NONE;
+    gNpcAutoMaxLvl[slot] = 0;
+    gNpcLastAutoTick[slot] = 0;
+    return 1;
+}
+
+stock SHRP_NpcBuildSelosSeq(elem, lvl, out[], outSize)
+{
+    out[0] = EOS;
+
+    // garante limites
+    if(lvl < 1) lvl = 1;
+    if(lvl > 3) lvl = 3;
+
+    switch(elem)
+    {
+        // Katon (1..3)
+        case NPC_ELEM_KATON:
+        {
+            if(lvl == 1) format(out, outSize, "Tigre, ");
+            else if(lvl == 2) format(out, outSize, "Tigre, Cobra, ");
+            else format(out, outSize, "Tigre, Cobra, Dragao, ");
+        }
+        // Suiton (1..3)
+        case NPC_ELEM_SUITON:
+        {
+            if(lvl == 1) format(out, outSize, "Cobra, ");
+            else if(lvl == 2) format(out, outSize, "Cobra, Coelho, ");
+            else format(out, outSize, "Cobra, Coelho, Dragao, ");
+        }
+        // Futon (1..3)
+        case NPC_ELEM_FUTON:
+        {
+            if(lvl == 1) format(out, outSize, "Coelho, ");
+            else if(lvl == 2) format(out, outSize, "Coelho, Tigre, ");
+            else format(out, outSize, "Coelho, Tigre, Dragao, ");
+        }
+        // Doton (1..3)
+        case NPC_ELEM_DOTON:
+        {
+            if(lvl == 1) format(out, outSize, "Dragao, ");
+            else if(lvl == 2) format(out, outSize, "Dragao, Rato, ");
+            else format(out, outSize, "Dragao, Rato, Tigre, ");
+        }
+        // Raiton (1..3)
+        case NPC_ELEM_RAITON:
+        {
+            if(lvl == 1) format(out, outSize, "Rato, ");
+            else if(lvl == 2) format(out, outSize, "Rato, Coelho, ");
+            else format(out, outSize, "Rato, Coelho, Dragao, ");
+        }
+    }
+    return 1;
+}
+
+stock SHRP_NpcTryCastSelos(slot, targetid)
+{
+    new npcid = gNpcId[slot];
+    if(npcid == INVALID_PLAYER_ID) return 0;
+
+    if(gNpcAutoElem[slot] == NPC_ELEM_NONE || gNpcAutoMaxLvl[slot] <= 0) return 0;
+
+    new now = GetTickCount();
+    if(now - gNpcLastAutoTick[slot] < gNpcAutoCooldownMs[slot]) return 0;
+
+    // escolhe aleatrio entre 1..max
+    new lvl = random(gNpcAutoMaxLvl[slot]) + 1;
+
+    new seq[64];
+    SHRP_NpcBuildSelosSeq(gNpcAutoElem[slot], lvl, seq, sizeof seq);
+    if(seq[0] == EOS) return 0;
+
+    // passa alvo pro Selos.pwn (targetid + 1)
+    if(SHRP_IsCombatEntity(targetid))
+        SetPVarInt(npcid, "NPCSelosTarget", targetid + 1);
+    else
+        SetPVarInt(npcid, "NPCSelosTarget", 0);
+
+    // dispara (Selos.pwn faz o cast real)
+    VerificarSelos(npcid, seq);
+
+    gNpcLastAutoTick[slot] = now;
     return 1;
 }
 
@@ -701,6 +829,16 @@ stock bool:Bandido_ApplyDamageFromPlayer(damagerid, damagedid, Float:damage)
             }
         }
 
+// ------------------------------------------------
+// Daily Missions (diarias_rank_txd): avisar morte de NPC de combate
+// NecessÃ¡rio para contar kills em DMT_PVE quando usamos FCNPC (shinobi_ai).
+// ------------------------------------------------
+if(funcidx("Daily_OnCombatNpcDead") != -1)
+{
+    // params: (killerid, npcid, aislot)
+    CallLocalFunction("Daily_OnCombatNpcDead", "iii", damagerid, damagedid, slot);
+}
+
         // despawn simples
         SetTimerEx("SHRP_Npc_DespawnLater", 2500, false, "i", slot);
     }
@@ -767,6 +905,10 @@ stock SHRP_NpcPickTarget(slot)
 
 stock SHRP_NpcTryCastJutsu(slot, targetid)
 {
+    // Auto-jutsu via Selos (se configurado) tem prioridade
+    if (gNpcAutoElem[slot] != NPC_ELEM_NONE && gNpcAutoMaxLvl[slot] > 0)
+        return SHRP_NpcTryCastSelos(slot, targetid);
+
     if (gNpcJutsuCmd[slot][0] == EOS) return 0;
 
     new now = GetTickCount();
@@ -889,10 +1031,10 @@ public SHRP_NpcAI_Tick()
                 new Float:d = SHRP_Dist3D(nx, ny, nz, ox, oy, oz);
                 if (d > gNpcFollowDist[slot] + 0.8)
                 {
-                    // segue em 2D (mantém Z do próprio NPC, não tenta subir/voar)
+                    // segue em 2D (mant?m Z do pr?prio NPC, n?o tenta subir/voar)
                     new Float:tx, Float:ty, Float:tz;
                     GetPlayerPos(owner, tx, ty, tz);
-                    tz = nz; // trava no chão do NPC
+                    tz = nz; // trava no ch?o do NPC
                     FCNPC_GoTo(npcid, tx, ty, tz);
                 }
                 else
@@ -964,12 +1106,12 @@ public SHRP_NpcAI_Tick()
 
             if (d2 > gNpcAttackRange[slot] || dz > 1.8)
             {
-                // persegue em 2D (mantém Z do próprio NPC, não tenta subir/voar)
+                // persegue em 2D (mant?m Z do pr?prio NPC, n?o tenta subir/voar)
                 new Float:tx, Float:ty, Float:tz;
                 GetPlayerPos(target, tx, ty, tz);
                 new Float:nx2, Float:ny2, Float:nz2;
                 FCNPC_GetPosition(npcid, nx2, ny2, nz2);
-                tz = nz2; // trava no chão do NPC
+                tz = nz2; // trava no ch?o do NPC
                 FCNPC_GoTo(npcid, tx, ty, tz);
             }
             else
